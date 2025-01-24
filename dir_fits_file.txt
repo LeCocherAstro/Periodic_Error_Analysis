@@ -1,0 +1,3 @@
+dir_fits_file,D:\Documents\DevAstro\2_PEC_Analyse\Fits\Fichiers_test_mickael
+tool,astap
+platesolve_off, 
