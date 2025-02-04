@@ -533,7 +533,7 @@ def my_fft(t,signal,Ts,PlotOption,Option2,TabSignalInfo):
   T_fond    = np.abs(1/Freq_fond)
 
   xlim_min_fft_freq   = 0.001
-  xlim_max_fft_freq   = 1/(Ts*2) #→0.015
+  xlim_max_fft_freq   = 1/(Ts*2)
   xlim_min_fft_period = 1/xlim_max_fft_freq
   xlim_max_fft_period = 1/xlim_min_fft_freq
 
@@ -551,7 +551,8 @@ def my_fft(t,signal,Ts,PlotOption,Option2,TabSignalInfo):
     # Amplitude function of frequency
     ax = fig.add_subplot(312)
     #plt.semilogx(freq, Spectre_amp)
-    plt.plot(freq, Spectre_amp)
+    #plt.plot(freq, Spectre_amp)
+    plt.plot(freq[0:int(Nspec/2-1)], Spectre_amp[0:int(Nspec/2-1)])
     plt.title("fft spectrum")
     plt.xlabel("frequency (Hz)")
     plt.grid()
@@ -577,7 +578,7 @@ def my_fft(t,signal,Ts,PlotOption,Option2,TabSignalInfo):
     # Amplitude function of period
     ax = fig.add_subplot(313)
     #plt.semilogx(1/freq, Spectre_amp)
-    plt.plot(1/freq, Spectre_amp)
+    plt.plot(1/freq[0:int(Nspec/2-1)], Spectre_amp[0:int(Nspec/2-1)])
     plt.title("fft spectrum")
     plt.xlabel("time (s)")
     plt.grid()
