@@ -25,7 +25,7 @@
        platesolve_on, 
 
   * Comments : 
-    * Fig.1 is not well finsih. The RA/CRVAL1 and DEC/CRVAL2 are in degree and 
+    * Fig.1 is not well finished. The RA/CRVAL1 and DEC/CRVAL2 are in degree and 
     not in "H:M:S" (hms) and "°:M:S" (dms)
     
 
