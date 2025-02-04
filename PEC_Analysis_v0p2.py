@@ -74,7 +74,7 @@ from numpy import linalg as LA
 version = 0.2
 
 # User option to define the end of the signal if necessary
-end_sequence_df = 1200 # 70
+end_sequence_df = 70 #1200 # 70
 # 1 : Plot FFT of all the main components of the signal, 0 : No plot
 Plot_FFT = 1
 
@@ -519,9 +519,9 @@ def my_fft(t,signal,Ts,PlotOption,Option2,TabSignalInfo):
   fourier = np.fft.fft(signal,Nspec)
   freq = np.fft.fftfreq(Nspec, d=Ts)
   Spectre_amp = np.abs(fourier)/signal.size
-  # Save_Spectre_amp_0 = Spectre_amp[0]
-  # Spectre_amp = 2*Spectre_amp
-  # Spectre_amp[0] = Save_Spectre_amp_0;
+  Save_Spectre_amp_0 = Spectre_amp[0]
+  Spectre_amp = 2*Spectre_amp
+  Spectre_amp[0] = Save_Spectre_amp_0;
   
   Spectre_phase = np.angle(fourier)
 
@@ -782,11 +782,11 @@ def ssa_plate_solve_data(sequence_df,end_sequence_df):
     RMSE = math.sqrt(MSE)
 
     if k == 1:
-      textstr = r'Max value of Fonf = %2.2f arcsec' % (Max_TabSignal, )
+      textstr = r'Max value of Fond = %2.2f arcsec' % (Max_TabSignal, )
       print(textstr)
-      textstr = r'Min value of Fonf = %2.2f arcsec' % (Min_TabSignal, )  
+      textstr = r'Min value of Fond = %2.2f arcsec' % (Min_TabSignal, )  
       print(textstr)
-      textstr = r'RMS value of Fonf = %2.2f arcsec' % (RMSE, )  
+      textstr = r'RMS value of Fond = %2.2f arcsec' % (RMSE, )  
       print(textstr)
     else:
       textstr = r'Max value of H%d = %2.2f arcsec' % (k-1, Max_TabSignal, )
