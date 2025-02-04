@@ -533,7 +533,7 @@ def my_fft(t,signal,Ts,PlotOption,Option2,TabSignalInfo):
   T_fond    = np.abs(1/Freq_fond)
 
   xlim_min_fft_freq   = 0.001
-  xlim_max_fft_freq   = 0.015
+  xlim_max_fft_freq   = 1/(Ts*2) #→0.015
   xlim_min_fft_period = 1/xlim_max_fft_freq
   xlim_max_fft_period = 1/xlim_min_fft_freq
 
@@ -759,8 +759,7 @@ def ssa_plate_solve_data(sequence_df,end_sequence_df):
   
   # 1st component - RA deviation
   poly_Deviation_RA = np.polyfit(t, TabSignal[:,0], 1)
-  RA_polynome = np.poly1d(poly_Deviation_RA)  # in arcsec
-  textstr = r'RA deviation - Slope =  %.5f arcsec/min' % (RA_polynome[0]*60, )
+  textstr = r'RA deviation - Slope =  %.3f arcsec/min between t=0 and t=%.1fs' % (poly_Deviation_RA[0]*60, t[signal.size-1], )
   print(textstr)
   
   ax = fig.add_subplot(nrows,1,1)
@@ -774,9 +773,10 @@ def ssa_plate_solve_data(sequence_df,end_sequence_df):
     borne_min = int(signal.size/2-T_fond/(2*Ts))
     borne_max = int(signal.size/2+T_fond/(2*Ts))
     # max
-    Max_TabSignal = np.max(TabSignal[borne_min:borne_max,k])
+    #Max_TabSignal = np.max(TabSignal[borne_min:borne_max,k])
+    Max_TabSignal = np.max(TabSignal[index_start_of_perriod_rms:index_start_of_perriod_rms+Nb_points-1,k])
     # min
-    Min_TabSignal = np.min(TabSignal[borne_min:borne_max,k])
+    Min_TabSignal = np.min(TabSignal[index_start_of_perriod_rms:index_start_of_perriod_rms+Nb_points-1,k])
     # RMSE
     MSE = np.square(TabSignal[index_start_of_perriod_rms:index_start_of_perriod_rms+Nb_points-1,k]).mean() 
     RMSE = math.sqrt(MSE)
