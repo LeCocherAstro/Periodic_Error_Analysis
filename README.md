@@ -29,11 +29,14 @@
     not in "H:M:S" (hms) and "°:M:S" (dms)
     
 
-*  Version 0.2 is coming soon
+*  Version 0.2 ![](PEC_Analysis_v0p2.py)
     * Add a decomposition of the signal in principal components in order to have
     an estimate of the frequency and amplitude of the main components and drift
+
+* Coming next :
     * Improve Fig. 1
     * Add a plate solve with PS3
+    * Design a version only for SIRIL tool (plate solve with GAIA)
 
 
 
