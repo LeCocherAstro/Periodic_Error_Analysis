@@ -33,7 +33,8 @@ import sirilpy as s
 from sirilpy import tksiril, LogColor, SirilError, SirilConnectionError
 
 # Ensure non-core modules are available in Siril's venv before importing them
-s.ensure_installed("ttkthemes", "numpy", "pandas", "matplotlib", "astropy", "unidecode")
+s.ensure_installed("ttkthemes", "numpy", "pandas", "matplotlib", "astropy",
+                   "unidecode", "reportlab")
 
 from ttkthemes import ThemedTk        # noqa: E402  (must follow ensure_installed)
 import numpy as np                    # noqa: E402
@@ -44,6 +45,10 @@ from numpy import linalg as LA        # noqa: E402
 from astropy.io import fits as astrofits  # noqa: E402
 from astropy.time import Time         # noqa: E402
 from unidecode import unidecode       # noqa: E402
+
+# reportlab — for the optional PDF report (imported lazily inside the
+# builder so that running the script without ticking 'Save PDF report'
+# doesn't pay the import cost on every launch).
 
 
 # =============================================================================
@@ -183,6 +188,43 @@ def _extract_platesolve_hints(fits_path, log):
         log(f"[PE] No FOCALLEN/XPIXSZ in {fits_path.name} — blind solving",
             color=LogColor.BLUE)
     return hints
+
+
+def _read_capture_metadata(fits_path):
+    """Read capture metadata (target, equipment, settings) from a FITS header.
+
+    Returns a dict keyed by friendly names; values are None when the
+    keyword is missing. Used both for auto-populating the GUI title field
+    and for the equipment table on the PDF report's title page.
+    """
+    try:
+        header = astrofits.getheader(str(fits_path))
+    except Exception:
+        return {}
+
+    def _get(*keys):
+        for key in keys:
+            value = header.get(key)
+            if value not in (None, "", " "):
+                return value
+        return None
+
+    return {
+        "object":        _get("OBJECT"),
+        "date_obs":      _get("DATE-OBS"),
+        "telescope":     _get("TELESCOP", "TELESCOPE"),
+        "camera":        _get("INSTRUME", "INSTRUMENT", "CAMERA"),
+        "focal_length":  _get("FOCALLEN"),
+        "pixel_size":    _get("XPIXSZ"),
+        "binning":       _get("XBINNING") or 1,
+        "exposure":      _get("EXPTIME", "EXPOSURE"),
+        "gain":          _get("GAIN", "EGAIN"),
+        "filter":        _get("FILTER"),
+        "observer":      _get("OBSERVER"),
+        "site_lat":      _get("SITELAT"),
+        "site_long":     _get("SITELONG"),
+        "ccd_temp":      _get("CCD-TEMP"),
+    }
 
 
 def _plate_solve_siril(fits_paths, siril, log):
@@ -357,14 +399,21 @@ def _time_axis(sequence_df):
 # Plotting & analysis
 # =============================================================================
 def _show_figure():
-    """Show the current matplotlib figure without blocking the Tk mainloop."""
-    plt.tight_layout()
+    """Show the current matplotlib figure without blocking the Tk mainloop.
+
+    Figures are created with constrained_layout=True, so we deliberately
+    do NOT call tight_layout() here — the two layout engines clash.
+    """
     plt.show(block=False)
     plt.pause(0.05)
 
 
 def _plot_plate_solve_data(sequence_df, log):
-    """Plot RA, DEC, CRVAL1, CRVAL2 and the linear drift in arcsec."""
+    """Plot RA, DEC, CRVAL1, CRVAL2 and the linear drift in arcsec.
+
+    Returns a dict with the two created figures and the headline drift
+    metrics so the optional PDF report can embed both.
+    """
     log("[PE] Plotting plate-solve data")
 
     t = _time_axis(sequence_df)
@@ -393,28 +442,28 @@ def _plot_plate_solve_data(sequence_df, log):
     )
 
     # ---- Fig 1: raw RA/DEC and CRVAL1/CRVAL2 ----
-    fig = plt.figure(figsize=(12, 8))
+    fig_raw = plt.figure(figsize=(12, 8), constrained_layout=True)
 
-    fig.add_subplot(221)
+    fig_raw.add_subplot(221)
     plt.plot(t, np.array(sequence_df["RA"]))
     plt.title("RA [°]")
     plt.grid()
     plt.xlim(0, t.max())
 
-    fig.add_subplot(222)
+    fig_raw.add_subplot(222)
     plt.plot(t, np.array(sequence_df["CRVAL1"]))
     plt.title("CRVAL1 [°]")
     plt.grid()
     plt.xlim(0, t.max())
 
-    fig.add_subplot(223)
+    fig_raw.add_subplot(223)
     plt.plot(t, np.array(sequence_df["DEC"]))
     plt.title("DEC [°]")
     plt.xlabel("time (in s)")
     plt.grid()
     plt.xlim(0, t.max())
 
-    fig.add_subplot(224)
+    fig_raw.add_subplot(224)
     plt.plot(t, np.array(sequence_df["CRVAL2"]))
     plt.title("CRVAL2 [°]")
     plt.xlabel("time (in s)")
@@ -425,9 +474,9 @@ def _plot_plate_solve_data(sequence_df, log):
     _show_figure()
 
     # ---- Fig 2: RA/DEC error in arcsec + linear drift ----
-    fig = plt.figure(figsize=(12, 8))
+    fig_drift = plt.figure(figsize=(12, 8), constrained_layout=True)
 
-    ax = fig.add_subplot(211)
+    ax = fig_drift.add_subplot(211)
     plt.plot(t, np.array(sequence_df["Delta_CRVAL1"]) * 3600, t, p1(t) * 3600)
     plt.title("RA error [arcsec]")
     plt.grid()
@@ -437,7 +486,7 @@ def _plot_plate_solve_data(sequence_df, log):
     ax.text(0.55, y_pos, txt, transform=ax.transAxes,
             fontsize=24, verticalalignment="top")
 
-    ax = fig.add_subplot(212)
+    ax = fig_drift.add_subplot(212)
     plt.plot(t, np.array(sequence_df["Delta_CRVAL2"]) * 3600, t, p2(t) * 3600)
     plt.title("DEC error [arcsec]")
     plt.xlabel("time (in s)")
@@ -449,6 +498,17 @@ def _plot_plate_solve_data(sequence_df, log):
             fontsize=24, verticalalignment="top")
 
     _show_figure()
+
+    return {
+        "figures": {"raw_ra_dec": fig_raw, "arcsec_drift": fig_drift},
+        "metrics": {
+            "time_span_s":               float(t.max()),
+            "ra_drift_arcsec_per_min":   float(poly_d1[0] * 3600 * 60),
+            "dec_drift_arcsec_per_min":  float(poly_d2[0] * 3600 * 60),
+            "ra_pp_arcsec":              float(diff_ra * 3600),
+            "dec_pp_arcsec":             float(diff_dec * 3600),
+        },
+    }
 
 
 def _ssa(x1, L, eigen_idx):
@@ -500,7 +560,11 @@ def _ssa(x1, L, eigen_idx):
 
 
 def _my_fft(t, signal, Ts, plot, mark_all_components, tab_info, log):
-    """FFT of `signal`, optionally plot, return fundamental (amp, phase, f, T)."""
+    """FFT of `signal`, optionally plot.
+
+    Returns a tuple ``(amp_fond, phase_fond, freq_fond, t_fond, fig)`` —
+    `fig` is the matplotlib Figure when `plot` is True, else None.
+    """
     fourier = np.fft.fft(signal, FFT_N_POINTS)
     freq = np.fft.fftfreq(FFT_N_POINTS, d=Ts)
 
@@ -516,13 +580,14 @@ def _my_fft(t, signal, Ts, plot, mark_all_components, tab_info, log):
     freq_fond  = float(np.abs(freq[idx_fond]))
     t_fond     = 1.0 / freq_fond if freq_fond > 0 else float("inf")
 
+    fig = None
     if plot:
         xlim_f_min = 0.001
         xlim_f_max = 1 / (Ts * 2)
         xlim_t_min = 1 / xlim_f_max
         xlim_t_max = 1 / xlim_f_min
 
-        fig = plt.figure(figsize=(12, 20))
+        fig = plt.figure(figsize=(12, 20), constrained_layout=True)
 
         plt.subplot(311)
         plt.plot(t, signal)
@@ -592,12 +657,18 @@ def _my_fft(t, signal, Ts, plot, mark_all_components, tab_info, log):
 
         _show_figure()
 
-    return amp_fond, phase_fond, freq_fond, t_fond
+    return amp_fond, phase_fond, freq_fond, t_fond, fig
 
 
 def _ssa_analysis(sequence_df, log):
-    """SSA decomposition + FFT + reconstruction (ported from v0p2)."""
+    """SSA decomposition + FFT + reconstruction (ported from v0p2).
+
+    Returns a dict ``{"figures": {...}, "metrics": {...}}`` so the
+    optional PDF report can embed both the plots and the headline numbers.
+    """
     log("[PE] Starting Singular Spectrum Analysis (SSA)", color=LogColor.BLUE)
+    figures = {}        # name -> matplotlib Figure
+    components = []     # per-sinusoid-pair metric dicts
 
     n = sequence_df["CRVAL1"].size
 
@@ -625,9 +696,9 @@ def _ssa_analysis(sequence_df, log):
     t = _time_axis(sequence_df)
 
     # ---- Fig 3: raw RA error + normalized singular spectrum ----
-    fig = plt.figure(figsize=(12, 8))
+    fig_spectrum = plt.figure(figsize=(12, 8), constrained_layout=True)
 
-    fig.add_subplot(211)
+    fig_spectrum.add_subplot(211)
     plt.plot(t, signal, marker="+")
     plt.title("RA error [arcsec]")
     plt.xlabel("time (in s)")
@@ -635,7 +706,7 @@ def _ssa_analysis(sequence_df, log):
     plt.xlim(0, t.max())
 
     sev = float(np.sum(eigvals))
-    fig.add_subplot(212)
+    fig_spectrum.add_subplot(212)
     plt.plot(range(1, L + 1), eigvals / sev, marker="+")
     plt.title("Normalized Singular Spectrum")
     plt.xlabel("Eigenvalue Number")
@@ -644,6 +715,7 @@ def _ssa_analysis(sequence_df, log):
     plt.xlim(1, 10)
 
     _show_figure()
+    figures["singular_spectrum"] = fig_spectrum
 
     # ---- Group eigencomponents into fundamental + harmonics ----
     tab_signal = np.zeros((n, SSA_NB_EIGEN))
@@ -676,9 +748,12 @@ def _ssa_analysis(sequence_df, log):
             (tab_info[1, i],
              tab_info[2, i],
              tab_info[3, i],
-             tab_info[4, i]) = _my_fft(
+             tab_info[4, i],
+             fig_fft_i) = _my_fft(
                 t, tab_signal[:, i], Ts, PLOT_FFT_PER_COMP, False, tab_info, log,
             )
+            if fig_fft_i is not None:
+                figures[f"fft_component_{i}"] = fig_fft_i
 
     # ---- Signal reconstruction + RMSE ----
     signal_rebuilt = np.sum(tab_signal, axis=1)
@@ -704,16 +779,16 @@ def _ssa_analysis(sequence_df, log):
         color=LogColor.GREEN)
 
     # ---- Fig 4: original vs reconstructed + reconstruction error ----
-    fig = plt.figure(figsize=(12, 8))
+    fig_recon = plt.figure(figsize=(12, 8), constrained_layout=True)
 
-    fig.add_subplot(211)
+    fig_recon.add_subplot(211)
     plt.plot(t, signal, t, signal_rebuilt, marker="+")
     plt.title("RA error and reconstructed signal [arcsec]")
     plt.ylabel("[arcsec]")
     plt.grid()
     plt.xlim(0, t.max())
 
-    ax = fig.add_subplot(212)
+    ax = fig_recon.add_subplot(212)
     plt.plot(t, err_signal, marker="+")
     plt.title("Error of reconstruction")
     plt.xlabel("time (in s)")
@@ -725,17 +800,19 @@ def _ssa_analysis(sequence_df, log):
             transform=ax.transAxes, fontsize=12, verticalalignment="top")
 
     _show_figure()
+    figures["reconstruction"] = fig_recon
 
     # ---- Fig 5: main components stacked vertically ----
-    fig = plt.figure(figsize=(12, 20))
+    fig_stacked = plt.figure(figsize=(12, 20), constrained_layout=True)
     nrows = SSA_GROUP_ORDER + 1
 
     # First subplot: the RA drift (1st grouped component)
     poly_dev = np.polyfit(t, tab_signal[:, 0], 1)
-    title0 = (f"RA deviation - Slope = {poly_dev[0] * 60:.3f} arcsec/min "
+    drift_slope_arcsec_per_min = float(poly_dev[0] * 60)
+    title0 = (f"RA deviation - Slope = {drift_slope_arcsec_per_min:.3f} arcsec/min "
               f"between t=0 and t={t[n - 1]:.1f}s")
     log(f"[PE] {title0}")
-    fig.add_subplot(nrows, 1, 1)
+    fig_stacked.add_subplot(nrows, 1, 1)
     plt.plot(t, tab_signal[:, 0])
     plt.title(title0)
     plt.ylabel("[arcsec]")
@@ -749,17 +826,24 @@ def _ssa_analysis(sequence_df, log):
         rms_v = math.sqrt(float(np.square(window).mean())) if window.size else 0.0
 
         if k == 1:
+            name = "Fond"
             title = f"Max value of Fond = {max_v:.2f} arcsec"
-            log(f"[PE] Max value of Fond = {max_v:.2f} arcsec")
-            log(f"[PE] Min value of Fond = {min_v:.2f} arcsec")
-            log(f"[PE] RMS value of Fond = {rms_v:.2f} arcsec")
         else:
+            name = f"H{k - 1}"
             title = f"Max value of H{k - 1} = {max_v:.2f} arcsec"
-            log(f"[PE] Max value of H{k - 1} = {max_v:.2f} arcsec")
-            log(f"[PE] Min value of H{k - 1} = {min_v:.2f} arcsec")
-            log(f"[PE] RMS value of H{k - 1} = {rms_v:.2f} arcsec")
+        log(f"[PE] Max value of {name} = {max_v:.2f} arcsec")
+        log(f"[PE] Min value of {name} = {min_v:.2f} arcsec")
+        log(f"[PE] RMS value of {name} = {rms_v:.2f} arcsec")
+        components.append({
+            "name":      name,
+            "period_s":  float(tab_info[4, k]) if tab_info[4, k] > 0 else None,
+            "amp_arcsec": float(tab_info[1, k]) if tab_info[1, k] > 0 else None,
+            "max_arcsec": max_v,
+            "min_arcsec": min_v,
+            "rms_arcsec": rms_v,
+        })
 
-        fig.add_subplot(nrows, 1, k + 1)
+        fig_stacked.add_subplot(nrows, 1, k + 1)
         plt.plot(t, tab_signal[:, k])
         plt.title(title)
         plt.ylabel("[arcsec]")
@@ -768,14 +852,376 @@ def _ssa_analysis(sequence_df, log):
 
     plt.xlabel("time (in s)")
     _show_figure()
+    figures["stacked_components"] = fig_stacked
 
     # ---- Fig 6: FFT of the harmonic signal (full RA error minus linear drift)
     poly_dev = np.polyfit(t, signal, 1)
     ra_polynome = np.poly1d(poly_dev)
     signal_fond = signal - ra_polynome(t)
-    _my_fft(t, signal_fond, Ts, True, True, tab_info, log)
+    _, _, _, _, fig_fft_all = _my_fft(t, signal_fond, Ts, True, True, tab_info, log)
+    if fig_fft_all is not None:
+        figures["fft_all_components"] = fig_fft_all
 
     log("[PE] End of Singular Spectrum Analysis (SSA)", color=LogColor.GREEN)
+
+    return {
+        "figures": figures,
+        "metrics": {
+            "n_frames":                   n,
+            "sampling_period_s":          Ts,
+            "fundamental_period_s":       float(T_fond),
+            "rmse_arcsec":                rmse,
+            "drift_slope_arcsec_per_min": drift_slope_arcsec_per_min,
+            "components":                 components,
+        },
+    }
+
+
+# =============================================================================
+# PDF report
+# =============================================================================
+def _format_long_date(iso_or_dt):
+    """'2024-03-03T22:53:21' -> 'March 3, 2024'  (no zero-padded day)."""
+    if iso_or_dt is None:
+        return ""
+    if isinstance(iso_or_dt, str):
+        try:
+            dt = pd.to_datetime(iso_or_dt)
+        except Exception:
+            return iso_or_dt
+    else:
+        dt = iso_or_dt
+    return f"{dt.strftime('%B')} {dt.day}, {dt.year}"
+
+
+def _fig_to_image_flowable(fig, max_width_pt, max_height_pt):
+    """Render a matplotlib Figure into a reportlab Image flowable."""
+    import io
+    from reportlab.lib.utils import ImageReader
+    from reportlab.platypus import Image as RLImage
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+    buf.seek(0)
+    reader = ImageReader(buf)
+    w_px, h_px = reader.getSize()
+    # Preserve aspect ratio, fit within (max_width_pt, max_height_pt).
+    scale = min(max_width_pt / w_px, max_height_pt / h_px)
+    return RLImage(buf, width=w_px * scale, height=h_px * scale)
+
+
+def _build_pdf_report(out_path, *,
+                      title, capture_metadata, solver, frame_range,
+                      drift_metrics, ssa_metrics, figures, log):
+    """Build the multi-page PDF report and write it to `out_path`.
+
+    `figures` is the merged dict from both analysis stages (string name
+    keys, matplotlib Figure values). The report embeds them inline at
+    the points where the corresponding numbers are discussed.
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle,
+    )
+    from datetime import datetime
+
+    doc = SimpleDocTemplate(
+        str(out_path), pagesize=A4,
+        leftMargin=2 * cm, rightMargin=2 * cm,
+        topMargin=2 * cm, bottomMargin=2 * cm,
+        title=title or "Periodic Error Analysis Report",
+        author=AUTHORS,
+    )
+    content_width = doc.width  # usable horizontal space in points
+    styles = getSampleStyleSheet()
+    h_title = ParagraphStyle("PEHeroTitle", parent=styles["Title"],
+                             fontSize=32, leading=38, alignment=TA_CENTER,
+                             spaceAfter=10)
+    h_sub = ParagraphStyle("PEHeroSub", parent=styles["Normal"],
+                           fontSize=16, leading=20, alignment=TA_CENTER,
+                           textColor=colors.HexColor("#444"), spaceAfter=4)
+    h_caption = ParagraphStyle("PECaption", parent=styles["Italic"],
+                               fontSize=9, alignment=TA_CENTER,
+                               textColor=colors.HexColor("#666"),
+                               spaceAfter=14)
+    h_section = ParagraphStyle("PESection", parent=styles["Heading2"],
+                               fontSize=16, leading=20, spaceBefore=12,
+                               spaceAfter=8,
+                               textColor=colors.HexColor("#222"))
+    h_body = ParagraphStyle("PEBody", parent=styles["BodyText"],
+                            fontSize=10.5, leading=14, alignment=TA_JUSTIFY,
+                            spaceAfter=6)
+
+    story = []
+
+    # ---- Title page -------------------------------------------------------
+    story.append(Spacer(0, 1.5 * cm))
+    story.append(Paragraph(title or "Periodic Error Analysis", h_title))
+    capture_date = _format_long_date(capture_metadata.get("date_obs"))
+    if capture_date:
+        story.append(Paragraph(capture_date, h_sub))
+    story.append(Paragraph("Periodic Error Analysis Report", h_sub))
+    story.append(Spacer(0, 0.5 * cm))
+
+    # Capture metadata table
+    meta_rows = [["Property", "Value"]]
+    def _add_meta(label, value, fmt=None):
+        if value not in (None, "", " "):
+            meta_rows.append([label, fmt(value) if fmt else str(value)])
+
+    _add_meta("Target",        capture_metadata.get("object"))
+    _add_meta("Capture start", capture_metadata.get("date_obs"))
+    _add_meta("Telescope",     capture_metadata.get("telescope"))
+    _add_meta("Camera",        capture_metadata.get("camera"))
+    _add_meta("Filter",        capture_metadata.get("filter"))
+    _add_meta("Focal length",  capture_metadata.get("focal_length"),
+              lambda v: f"{float(v):g} mm")
+    _add_meta("Pixel size",    capture_metadata.get("pixel_size"),
+              lambda v: f"{float(v):g} μm")
+    _add_meta("Binning",       capture_metadata.get("binning"),
+              lambda v: f"{int(v)}×{int(v)}")
+    _add_meta("Exposure",      capture_metadata.get("exposure"),
+              lambda v: f"{float(v):g} s")
+    _add_meta("Gain",          capture_metadata.get("gain"))
+    _add_meta("CCD temp",      capture_metadata.get("ccd_temp"),
+              lambda v: f"{float(v):g} °C")
+    _add_meta("Observer",      capture_metadata.get("observer"))
+
+    meta_rows.append(["Plate-solver", solver])
+    meta_rows.append(["Frames analysed",
+                      f"{frame_range[0]}–{frame_range[1]} "
+                      f"({frame_range[1] - frame_range[0] + 1} frames)"])
+    meta_rows.append(["Mean sampling period",
+                      f"{ssa_metrics['sampling_period_s']:.3f} s"])
+    meta_rows.append(["Time span",
+                      f"{drift_metrics['time_span_s']:.1f} s "
+                      f"({drift_metrics['time_span_s'] / 60:.1f} min)"])
+
+    table = Table(meta_rows, colWidths=[5 * cm, content_width - 5 * cm])
+    table.setStyle(TableStyle([
+        ("BACKGROUND",  (0, 0), (-1, 0), colors.HexColor("#2e2e2e")),
+        ("TEXTCOLOR",   (0, 0), (-1, 0), colors.white),
+        ("FONTNAME",    (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("ALIGN",       (0, 0), (-1, 0), "LEFT"),
+        ("GRID",        (0, 0), (-1, -1), 0.4, colors.HexColor("#ccc")),
+        ("FONTSIZE",    (0, 0), (-1, -1), 10),
+        ("VALIGN",      (0, 0), (-1, -1), "TOP"),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING",    (0, 0), (-1, -1), 4),
+    ]))
+    story.append(table)
+
+    story.append(Spacer(0, 0.6 * cm))
+    story.append(Paragraph(
+        f"Generated by {APP_NAME} v{VERSION} on "
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.", h_caption))
+
+    # ---- Introduction -----------------------------------------------------
+    story.append(PageBreak())
+    story.append(Paragraph("Introduction", h_section))
+    story.append(Paragraph(
+        "Periodic error (PE) is a recurring tracking inaccuracy in equatorial "
+        "telescope mounts. It originates primarily from imperfections in the "
+        "right-ascension worm gear: each rotation of the worm imprints a "
+        "characteristic sinusoidal drift on the right-ascension axis, with a "
+        "period equal to the worm's revolution time (commonly a few minutes). "
+        "Additional harmonics — at half, third, quarter the fundamental "
+        "period — arise from manufacturing tolerances and load asymmetries.",
+        h_body))
+    story.append(Paragraph(
+        "Quantifying PE matters because it directly limits unguided exposure "
+        "length and, even when autoguiding, drives the residual error that "
+        "the guider must correct. Measuring the fundamental period, amplitude "
+        "and harmonic content informs mount tuning, gear lapping decisions, "
+        "and the configuration of permanent periodic-error correction (PEC) "
+        "tables.", h_body))
+
+    # ---- Methodology ------------------------------------------------------
+    story.append(Paragraph("Methodology", h_section))
+    story.append(Paragraph(
+        f"Each FITS frame in the selected window ({frame_range[0]}–"
+        f"{frame_range[1]}) is plate-solved with {solver}. The right-"
+        "ascension of the image center (FITS keyword <i>CRVAL1</i>) is "
+        "extracted with its DATE-OBS timestamp, yielding a discrete RA-"
+        "versus-time signal sampled at the capture cadence.", h_body))
+    story.append(Paragraph(
+        "The RA signal is then decomposed by Singular Spectrum Analysis "
+        "(SSA), a model-free technique that builds a trajectory matrix from "
+        "the signal, performs an SVD, and reconstructs the components from "
+        "the leading eigentriples. Adjacent eigenpairs with similar "
+        "eigenvalues are merged as sinusoid pairs, identifying the secular "
+        "drift, the worm-period fundamental, and the dominant harmonics. "
+        "An FFT applied to each grouped sinusoid yields its precise period "
+        "and amplitude.", h_body))
+    story.append(Paragraph(
+        "The implementation follows F.J. Alonso-Sanchez (Univ. of "
+        "Extremadura) and F. Auger (Nantes Univ.), <i>The Sliding Singular "
+        "Spectrum Analysis: A Data-Driven Nonstationary Signal Decomposition "
+        "Tool</i>, IEEE Transactions on Signal Processing, vol. 66 no. 1, "
+        "January 2018.", h_body))
+
+    # ---- Results ----------------------------------------------------------
+    story.append(PageBreak())
+    story.append(Paragraph("Results — drift analysis", h_section))
+    story.append(Paragraph(
+        f"Over the {drift_metrics['time_span_s']:.0f}-second capture, the "
+        f"right-ascension drift accumulates "
+        f"{drift_metrics['ra_pp_arcsec']:.1f} arcsec peak-to-peak with a "
+        f"mean linear rate of "
+        f"<b>{drift_metrics['ra_drift_arcsec_per_min']:.3f} arcsec/min</b>. "
+        f"The declination drift is "
+        f"{drift_metrics['dec_pp_arcsec']:.1f} arcsec peak-to-peak at "
+        f"<b>{drift_metrics['dec_drift_arcsec_per_min']:.3f} arcsec/min</b> — "
+        "small DEC drift is expected on a well-polar-aligned equatorial "
+        "mount; large values point to polar-alignment error or differential "
+        "flexure.", h_body))
+    if "raw_ra_dec" in figures:
+        story.append(_fig_to_image_flowable(figures["raw_ra_dec"],
+                                            content_width, 14 * cm))
+        story.append(Paragraph(
+            "Figure 1 — Raw RA/DEC (telescope-reported) and CRVAL1/CRVAL2 "
+            "(plate-solved) versus time.", h_caption))
+    if "arcsec_drift" in figures:
+        story.append(_fig_to_image_flowable(figures["arcsec_drift"],
+                                            content_width, 14 * cm))
+        story.append(Paragraph(
+            "Figure 2 — RA and DEC error in arcseconds with the fitted "
+            "linear drift overlaid.", h_caption))
+
+    story.append(PageBreak())
+    story.append(Paragraph("Results — Singular Spectrum Analysis", h_section))
+    story.append(Paragraph(
+        f"SSA was applied to the RA error signal over "
+        f"{ssa_metrics['n_frames']} samples (mean sampling period "
+        f"{ssa_metrics['sampling_period_s']:.2f} s), extracting "
+        f"{SSA_NB_EIGEN} eigencomponents grouped into "
+        f"{SSA_GROUP_ORDER + 1} dominant components (the secular drift "
+        "plus the fundamental and four harmonics).", h_body))
+    if "singular_spectrum" in figures:
+        story.append(_fig_to_image_flowable(figures["singular_spectrum"],
+                                            content_width, 14 * cm))
+        story.append(Paragraph(
+            "Figure 3 — Top: raw RA error. Bottom: normalized singular "
+            "spectrum (eigenvalue energy fractions) — a steep drop after "
+            "the leading eigentriples confirms that the signal is dominated "
+            "by a few periodic components.", h_caption))
+
+    story.append(PageBreak())
+    story.append(Paragraph("Results — periodic components", h_section))
+    # Per-component metrics table
+    comp_rows = [["Component", "Period (s)", "RMS (arcsec)",
+                  "Min (arcsec)", "Max (arcsec)"]]
+    for c in ssa_metrics["components"]:
+        comp_rows.append([
+            c["name"],
+            f"{c['period_s']:.2f}" if c["period_s"] else "—",
+            f"{c['rms_arcsec']:.2f}",
+            f"{c['min_arcsec']:+.2f}",
+            f"{c['max_arcsec']:+.2f}",
+        ])
+    comp_table = Table(comp_rows, hAlign="LEFT",
+                       colWidths=[3 * cm, 3 * cm, 3 * cm, 3 * cm, 3 * cm])
+    comp_table.setStyle(TableStyle([
+        ("BACKGROUND",  (0, 0), (-1, 0), colors.HexColor("#2e2e2e")),
+        ("TEXTCOLOR",   (0, 0), (-1, 0), colors.white),
+        ("FONTNAME",    (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("ALIGN",       (1, 1), (-1, -1), "RIGHT"),
+        ("GRID",        (0, 0), (-1, -1), 0.4, colors.HexColor("#ccc")),
+        ("FONTSIZE",    (0, 0), (-1, -1), 10),
+    ]))
+    story.append(comp_table)
+    story.append(Spacer(0, 0.4 * cm))
+    if "stacked_components" in figures:
+        story.append(_fig_to_image_flowable(figures["stacked_components"],
+                                            content_width, 22 * cm))
+        story.append(Paragraph(
+            "Figure 4 — Stacked SSA components: secular drift plus the "
+            "fundamental and four harmonics, each annotated with its peak "
+            "amplitude.", h_caption))
+    if "fft_all_components" in figures:
+        story.append(PageBreak())
+        story.append(_fig_to_image_flowable(figures["fft_all_components"],
+                                            content_width, 22 * cm))
+        story.append(Paragraph(
+            "Figure 5 — FFT of the detrended RA error with the SSA-"
+            "identified periods marked. Sharp peaks at the fundamental "
+            "and integer fractions confirm the harmonic structure of the "
+            "worm gear's error signature.", h_caption))
+
+    story.append(PageBreak())
+    story.append(Paragraph("Results — signal reconstruction", h_section))
+    story.append(Paragraph(
+        f"Summing the {SSA_GROUP_ORDER + 1} grouped SSA components yields "
+        f"a reconstruction of the original RA error with a residual RMS of "
+        f"<b>{ssa_metrics['rmse_arcsec']:.2f} arcsec</b>. A low RMSE "
+        "indicates that the dominant tracking error is well-described by "
+        "the secular drift plus a handful of sinusoidal components — "
+        "exactly the structure a PEC table can correct. A high RMSE points "
+        "to non-periodic noise (seeing, wind, flexure) that PEC cannot "
+        "address.", h_body))
+    if "reconstruction" in figures:
+        story.append(_fig_to_image_flowable(figures["reconstruction"],
+                                            content_width, 14 * cm))
+        story.append(Paragraph(
+            "Figure 6 — Top: original RA error (blue) and SSA reconstruction "
+            "(orange). Bottom: residual error (original minus reconstruction).",
+            h_caption))
+
+    # ---- Discussion -------------------------------------------------------
+    story.append(PageBreak())
+    story.append(Paragraph("Discussion", h_section))
+    fund_period = ssa_metrics["fundamental_period_s"]
+    fund_comp = next((c for c in ssa_metrics["components"]
+                      if c["name"] == "Fond"), None)
+    fund_pp = ((fund_comp["max_arcsec"] - fund_comp["min_arcsec"])
+               if fund_comp else 0.0)
+    drift_rate = drift_metrics["ra_drift_arcsec_per_min"]
+    fund_text = (
+        f"The dominant periodic component has a period of "
+        f"<b>{fund_period:.1f} seconds</b> "
+        f"({fund_period / 60:.2f} min) with a peak-to-peak amplitude of "
+        f"<b>{fund_pp:.1f} arcsec</b>. "
+    ) if fund_comp else ""
+    story.append(Paragraph(
+        fund_text +
+        f"The RA secular drift over the capture averages "
+        f"{drift_rate:+.2f} arcsec/min; values within ±1 arcsec/min are "
+        "typically consistent with a small polar-alignment residual, while "
+        "larger drifts warrant a polar-alignment check before further mount "
+        "tuning.", h_body))
+    harmonic_text = []
+    for c in ssa_metrics["components"]:
+        if c["name"].startswith("H") and c["period_s"]:
+            harmonic_text.append(
+                f"<b>{c['name']}</b> at {c['period_s']:.1f}s "
+                f"(rms {c['rms_arcsec']:.2f}″)")
+    if harmonic_text:
+        story.append(Paragraph(
+            "Identified harmonics: " + "; ".join(harmonic_text) + ". "
+            "Harmonics at integer fractions of the fundamental period are the "
+            "fingerprint of worm-gear manufacturing tolerances and can be "
+            "compensated by a sufficiently dense PEC table.", h_body))
+    story.append(Paragraph(
+        f"With a reconstruction RMSE of {ssa_metrics['rmse_arcsec']:.2f} "
+        "arcsec, the residual error after removing drift and the modelled "
+        f"{SSA_GROUP_ORDER + 1}-component periodic structure represents the "
+        "stochastic floor (seeing, wind buffeting, flexure). PEC can address "
+        "the periodic part; reducing the residual requires improvements to "
+        "the optical train rigidity, autoguiding, or the observing site.",
+        h_body))
+    story.append(Paragraph(
+        "<b>Caveats.</b> The analysis is sensitive to the chosen frame "
+        "window. Windows shorter than two worm cycles may misidentify the "
+        "fundamental period. Plate-solver scatter (typically a few tenths "
+        "of an arcsecond per frame) sets a noise floor on the residual "
+        "RMSE that no amount of mount improvement can lower.", h_body))
+
+    doc.build(story)
+    log(f"[PE] PDF report saved to {out_path}", color=LogColor.GREEN)
 
 
 # =============================================================================
@@ -783,7 +1229,8 @@ def _ssa_analysis(sequence_df, log):
 # =============================================================================
 def compute_periodic_error(fits_files, first_idx, last_idx,
                            use_astap, astap_cli, siril,
-                           do_plate_solve, log):
+                           do_plate_solve, log,
+                           save_pdf=False, report_title=None):
     """Run the full PE pipeline on the selected FITS window.
 
     The work is synchronous (the GUI freezes during plate-solving on large
@@ -821,9 +1268,35 @@ def compute_periodic_error(fits_files, first_idx, last_idx,
     if len(sequence_df) > len(selected):
         sequence_df = sequence_df.iloc[:len(selected)].copy()
 
-    _plot_plate_solve_data(sequence_df, log)
-    _ssa_analysis(sequence_df, log)
+    drift_result = _plot_plate_solve_data(sequence_df, log)
+    ssa_result = _ssa_analysis(sequence_df, log)
     log("[PE] Analysis complete.", color=LogColor.GREEN)
+
+    if save_pdf:
+        fits_folder = selected[0].parent
+        capture_metadata = _read_capture_metadata(selected[0])
+        # Title precedence: explicit GUI override > OBJECT keyword > folder name
+        effective_title = (report_title or "").strip()
+        if not effective_title:
+            effective_title = (capture_metadata.get("object")
+                               or fits_folder.name)
+        from datetime import datetime
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = fits_folder.name.replace(" ", "_").replace("/", "_")
+        out_path = fits_folder / f"{safe_name}_PE_report_{stamp}.pdf"
+        log(f"[PE] Building PDF report at {out_path}", color=LogColor.BLUE)
+        merged_figures = {**drift_result["figures"], **ssa_result["figures"]}
+        _build_pdf_report(
+            out_path,
+            title=effective_title,
+            capture_metadata=capture_metadata,
+            solver="ASTAP" if use_astap else "Siril (GAIA)",
+            frame_range=(first_idx, last_idx),
+            drift_metrics=drift_result["metrics"],
+            ssa_metrics=ssa_result["metrics"],
+            figures=merged_figures,
+            log=log,
+        )
 
 
 # =============================================================================
@@ -897,6 +1370,18 @@ class PEAnalysisInterface:
         self.begin_index_var     = tk.IntVar(self.root,    value=1)
         self.end_index_var       = tk.IntVar(self.root,    value=self.nb_fits)
         self.do_plate_solve_var  = tk.BooleanVar(self.root, value=True)
+        self.save_pdf_var        = tk.BooleanVar(self.root, value=False)
+
+        # Auto-populate the report title from the first FITS file's OBJECT
+        # keyword, falling back to the working-directory name. The user can
+        # override it in the Report frame's text entry before clicking Process.
+        try:
+            self._capture_metadata = _read_capture_metadata(self.fits_files[0])
+        except Exception:
+            self._capture_metadata = {}
+        default_title = (self._capture_metadata.get("object")
+                         or self.working_dir.name)
+        self.report_title_var = tk.StringVar(self.root, value=default_title)
 
         # Build and theme the UI
         self._create_widgets()
@@ -970,6 +1455,36 @@ class PEAnalysisInterface:
         tksiril.create_tooltip(
             plate_solve_cb,
             "Disable to reuse plate-solving results from a previous run.",
+        )
+
+        # Report frame (title + save PDF checkbox)
+        report_frame = ttk.LabelFrame(main_frame, text="Report", padding=10)
+        report_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Label(report_frame, text="Title:").grid(
+            row=0, column=0, sticky="e", padx=5, pady=2)
+        title_entry = ttk.Entry(
+            report_frame, textvariable=self.report_title_var, width=50,
+        )
+        title_entry.grid(row=0, column=1, sticky="we", padx=5, pady=2)
+        report_frame.columnconfigure(1, weight=1)
+        tksiril.create_tooltip(
+            title_entry,
+            "Title for the PDF report's cover page. Auto-populated from the "
+            "FITS OBJECT keyword (or the FITS folder name) — edit as needed.",
+        )
+
+        save_pdf_cb = ttk.Checkbutton(
+            report_frame, text="Save PDF report",
+            variable=self.save_pdf_var,
+        )
+        save_pdf_cb.grid(row=1, column=0, columnspan=2, sticky="w",
+                         padx=5, pady=(6, 0))
+        tksiril.create_tooltip(
+            save_pdf_cb,
+            "When enabled, a multi-page PDF report (cover, methodology, "
+            "results with embedded figures, discussion) is written next to "
+            "the FITS folder after analysis completes.",
         )
 
         # Buttons
@@ -1061,6 +1576,8 @@ class PEAnalysisInterface:
                 self.astap_path_var.get(), self.siril,
                 self.do_plate_solve_var.get(),
                 self._log,
+                save_pdf=self.save_pdf_var.get(),
+                report_title=self.report_title_var.get(),
             )
         except FileNotFoundError as exc:
             self.siril.log(f"[PE] {exc}", color=LogColor.RED)
