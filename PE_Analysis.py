@@ -7,12 +7,24 @@ from Siril's working directory, lets the user pick the plate-solving
 engine (ASTAP or Siril/GAIA) and the frame index range, then runs the
 analysis.
 
+The PE algorithm is the same one prototyped in PEC_Analysis_v0p2.py:
+  1. plate-solve each frame with ASTAP (CLI)
+  2. parse the resulting .wcs files into a DataFrame indexed by DATE-OBS
+  3. plot RA / DEC drift vs time and a linear drift fit
+  4. decompose the RA error signal with Singular Spectrum Analysis (SSA),
+     group eigencomponents into fundamental + harmonics, and characterise
+     each via FFT (amplitude, frequency, period)
+  5. reconstruct the signal, plot the components and the reconstruction RMSE
+
 Follows the official Siril Python scripting template:
 https://siril.readthedocs.io/en/stable/scripts/python_gui_template
 """
 
 # Core module imports
 import csv
+import math
+import shutil
+import subprocess
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -21,11 +33,16 @@ import sirilpy as s
 from sirilpy import tksiril, LogColor, SirilError, SirilConnectionError
 
 # Ensure non-core modules are available in Siril's venv before importing them
-s.ensure_installed("ttkthemes")
-# When the PE algorithm is wired up, also declare its dependencies here, e.g.:
-# s.ensure_installed("numpy", "pandas", "matplotlib", "astropy")
+s.ensure_installed("ttkthemes", "numpy", "pandas", "matplotlib", "astropy", "unidecode")
 
-from ttkthemes import ThemedTk  # noqa: E402  (must follow ensure_installed)
+from ttkthemes import ThemedTk        # noqa: E402  (must follow ensure_installed)
+import numpy as np                    # noqa: E402
+import pandas as pd                   # noqa: E402
+import matplotlib                     # noqa: E402
+import matplotlib.pyplot as plt       # noqa: E402
+from numpy import linalg as LA        # noqa: E402
+from astropy.time import Time         # noqa: E402
+from unidecode import unidecode       # noqa: E402
 
 
 # =============================================================================
@@ -33,7 +50,7 @@ from ttkthemes import ThemedTk  # noqa: E402  (must follow ensure_installed)
 # =============================================================================
 APP_NAME       = "Automatic Periodic Error Computation"
 AUTHORS        = "Mickaël HILAIRET and Gilles MORAIN"
-VERSION        = "0.4.0"
+VERSION        = "0.5.0"
 REQUIRED_SIRIL = "1.3.6"
 
 DEFAULT_ASTAP_CLI = "/Applications/ASTAP.app/Contents/MacOS/astap"
@@ -41,6 +58,17 @@ DEFAULT_SIRIL_CLI = "/Applications/Siril.app/Contents/MacOS/siril-cli"
 
 SCRIPT_DIR  = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "config_PE.txt"
+
+# SSA / FFT tuning (kept identical to v0p2 to preserve published results)
+SSA_NB_EIGEN        = 10        # Number of SSA eigencomponents to compute
+SSA_GROUP_ORDER     = 5         # Fundamental + 5 harmonics
+SSA_PAIR_THRESHOLD  = 0.30      # Eigenvalue ratio under which two adjacent
+                                # components are merged as a sinusoid pair
+SSA_WINDOW_RATIO    = 5.71      # L = N / SSA_WINDOW_RATIO  (cf. v0p2)
+FFT_N_POINTS        = 64 * 1024
+PLOT_FFT_PER_COMP   = True      # Plot FFT for every sinusoidal component
+
+WCS_SUBDIR_NAME     = "PlateSolveAstap"
 
 
 # =============================================================================
@@ -66,20 +94,612 @@ def save_config(astap_path, siril_path):
 
 
 # =============================================================================
-# PE algorithm placeholder
+# Plate-solving
+# =============================================================================
+def _plate_solve_astap(fits_paths, astap_cli, wcs_dir, log):
+    """Run ASTAP CLI on each FITS file, writing .wcs results into wcs_dir.
+
+    The directory is wiped first so the analysis stage sees exactly the
+    frames that were selected in the GUI.
+    """
+    if not Path(astap_cli).is_file():
+        raise FileNotFoundError(f"ASTAP executable not found: {astap_cli}")
+
+    if wcs_dir.exists():
+        log(f"[PE] Clearing previous results directory {wcs_dir}")
+        shutil.rmtree(wcs_dir)
+    wcs_dir.mkdir(parents=True)
+
+    n = len(fits_paths)
+    log(f"[PE] Running ASTAP on {n} frames", color=LogColor.BLUE)
+    for i, fits_file in enumerate(fits_paths, 1):
+        output_file = wcs_dir / (fits_file.stem + ".wcs")
+        # `-update <input>` makes ASTAP update the original FITS header in place;
+        # `-o <output>` controls where the .wcs sidecar is written.
+        cmd = [
+            str(astap_cli),
+            "-f", str(fits_file),
+            "-o", str(output_file),
+            "-update", str(fits_file),
+        ]
+        log(f"[PE]   [{i}/{n}] Solving {fits_file.name}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            # ASTAP error codes: 1=no solution, 2=not enough stars, 16=read err,
+            # 32=no star db, 33=star db read err, 34=update err
+            log(
+                f"[PE]     ASTAP returned {result.returncode} for {fits_file.name}",
+                color=LogColor.RED,
+            )
+
+    log("[PE] ASTAP plate-solving complete.", color=LogColor.GREEN)
+
+
+# =============================================================================
+# WCS parsing
+# =============================================================================
+# Header keys ASTAP writes as floats / ints — parse them as such for arithmetic.
+_FLOAT_KEYS = {
+    "EXPOSURE", "EXPTIME", "EGAIN", "XPIXSZ", "YPIXSZ", "CCD-TEMP",
+    "FOCALLEN", "FOCRATIO", "RA", "DEC", "CENTALT", "CENTAZ",
+    "AIRMASS", "SITEELEV", "SITELAT", "SITELONG",
+    "CRVAL1", "CRVAL2",
+    "HFD", "STARS", "OBJCTROT", "CLOUDCVR", "HUMIDITY", "PRESSURE",
+    "AMBTEMP", "WINDDIR", "WINDSPD",
+    "EQUINOX", "CRPIX1", "CRPIX2", "CDELT1", "CDELT2",
+    "CROTA1", "CROTA2", "CD1_1", "CD1_2", "CD2_1", "CD2_2",
+}
+_INT_KEYS = {
+    "BITPIX", "NAXIS", "BZERO", "XBINNING", "YBINNING", "GAIN", "OFFSET",
+    "USBLIMIT", "FOCPOS", "FOCUSPOS", "XBAYROFF", "YBAYROFF",
+}
+
+
+def _parse_arcsec_offset(token):
+    """Parse an ASTAP mount-offset token like '12.3"' or '0.5\\''."""
+    token = token.strip()
+    if token.endswith("'"):
+        return float(token[:-1]) * 60.0    # arcmin → arcsec
+    if token.endswith('"'):
+        return float(token[:-1])
+    return None
+
+
+def _wcs_read_as_dict(wcs_file):
+    """Parse one .wcs file into a dict (ported from v0p2 with cleanups)."""
+    d = {}
+    comment_count = 0
+    with open(wcs_file, encoding="utf8", errors="ignore") as fp:
+        for line in fp:
+            if line.startswith("COMMENT 7"):
+                # COMMENT 7 holds the ASTAP mount offset for RA and DEC
+                parts = line.split(",")
+                mount_offset_ra = None
+                mount_offset_dec = None
+                try:
+                    mount_offset_ra = _parse_arcsec_offset(
+                        parts[0].split("=")[1]
+                    )
+                except (IndexError, ValueError):
+                    pass
+                try:
+                    mount_offset_dec = _parse_arcsec_offset(
+                        parts[1].split("=")[1]
+                    )
+                except (IndexError, ValueError):
+                    pass
+                d["OFFSETRA"] = mount_offset_ra
+                d["OFFSETDE"] = mount_offset_dec
+            elif line.startswith("COMMENT"):
+                d[f"COMMENT{comment_count}"] = unidecode(
+                    line.split("COMMENT ", 1)[1].strip()
+                )
+                comment_count += 1
+            else:
+                try:
+                    key = line.split("=")[0].strip().replace("'", "")
+                    val = (
+                        line.split("=")[1].split("/")[0].strip().replace("'", "")
+                    )
+                    if key in _FLOAT_KEYS:
+                        val = float(val)
+                    elif key in _INT_KEYS:
+                        val = int(val)
+                    d[key] = val
+                except (IndexError, ValueError):
+                    d["OTHER"] = line.strip()
+    return d
+
+
+def _load_wcs_from_folder(wcs_dir, log):
+    """Load all .wcs files in wcs_dir into a DataFrame sorted by DATE-OBS."""
+    wcs_files = sorted(p for p in wcs_dir.glob("*.wcs") if p.is_file())
+    log(f"[PE] Loading {len(wcs_files)} WCS files from {wcs_dir}")
+    if not wcs_files:
+        raise FileNotFoundError(f"No .wcs files found in {wcs_dir}")
+
+    records = [_wcs_read_as_dict(f) for f in wcs_files]
+    df = pd.DataFrame.from_records(records)
+
+    if "DATE-OBS" in df.columns:
+        df["DATE-OBS"] = pd.to_datetime(df["DATE-OBS"], errors="coerce")
+        df.set_index("DATE-OBS", drop=False, inplace=True)
+        df.sort_index(inplace=True)
+        df["FRAME_NUM"] = df.reset_index(drop=True).index.values
+        df["TIME_DIFF"] = df["DATE-OBS"].diff().dt.total_seconds()
+        df["TIME_REL"] = (
+            df["DATE-OBS"] - df["DATE-OBS"].min()
+        ).dt.total_seconds()
+
+    return df
+
+
+def _time_axis(sequence_df):
+    """Return a numpy time-from-start array (seconds), preferring DATE-LOC."""
+    for key in ("DATE-LOC", "DATE-OBS"):
+        if key in sequence_df.columns and sequence_df[key].notna().all():
+            t_abs = Time(sequence_df[key].astype(str).tolist(), format="fits")
+            return t_abs.unix - t_abs[0].unix
+    raise ValueError("Neither DATE-LOC nor DATE-OBS available in WCS data")
+
+
+# =============================================================================
+# Plotting & analysis
+# =============================================================================
+def _show_figure():
+    """Show the current matplotlib figure without blocking the Tk mainloop."""
+    plt.tight_layout()
+    plt.show(block=False)
+    plt.pause(0.05)
+
+
+def _plot_plate_solve_data(sequence_df, log):
+    """Plot RA, DEC, CRVAL1, CRVAL2 and the linear drift in arcsec."""
+    log("[PE] Plotting plate-solve data")
+
+    t = _time_axis(sequence_df)
+
+    sequence_df["Delta_CRVAL1"] = (
+        sequence_df["CRVAL1"] - sequence_df["CRVAL1"].iloc[0]
+    )
+    sequence_df["Delta_CRVAL2"] = (
+        sequence_df["CRVAL2"] - sequence_df["CRVAL2"].iloc[0]
+    )
+
+    poly_d1 = np.polyfit(t, sequence_df["Delta_CRVAL1"], 1)
+    poly_d2 = np.polyfit(t, sequence_df["Delta_CRVAL2"], 1)
+    p1 = np.poly1d(poly_d1)
+    p2 = np.poly1d(poly_d2)
+
+    diff_ra = sequence_df["CRVAL1"].max() - sequence_df["CRVAL1"].min()
+    diff_dec = sequence_df["CRVAL2"].max() - sequence_df["CRVAL2"].min()
+    log(
+        f"[PE] RA drift amplitude: {diff_ra * 3600:.2f} arcsec over "
+        f"{t.max():.2f}s  ({poly_d1[0] * 3600 * 60:.3f} arcsec/min)"
+    )
+    log(
+        f"[PE] DEC drift amplitude: {diff_dec * 3600:.3f} arcsec over "
+        f"{t.max():.2f}s  ({poly_d2[0] * 3600 * 60:.3f} arcsec/min)"
+    )
+
+    # ---- Fig 1: raw RA/DEC and CRVAL1/CRVAL2 ----
+    fig = plt.figure(figsize=(12, 8))
+
+    fig.add_subplot(221)
+    plt.plot(t, np.array(sequence_df["RA"]))
+    plt.title("RA [°]")
+    plt.grid()
+    plt.xlim(0, t.max())
+
+    fig.add_subplot(222)
+    plt.plot(t, np.array(sequence_df["CRVAL1"]))
+    plt.title("CRVAL1 [°]")
+    plt.grid()
+    plt.xlim(0, t.max())
+
+    fig.add_subplot(223)
+    plt.plot(t, np.array(sequence_df["DEC"]))
+    plt.title("DEC [°]")
+    plt.xlabel("time (in s)")
+    plt.grid()
+    plt.xlim(0, t.max())
+
+    fig.add_subplot(224)
+    plt.plot(t, np.array(sequence_df["CRVAL2"]))
+    plt.title("CRVAL2 [°]")
+    plt.xlabel("time (in s)")
+    plt.ylabel("DEC")
+    plt.grid()
+    plt.xlim(0, t.max())
+
+    _show_figure()
+
+    # ---- Fig 2: RA/DEC error in arcsec + linear drift ----
+    fig = plt.figure(figsize=(12, 8))
+
+    ax = fig.add_subplot(211)
+    plt.plot(t, np.array(sequence_df["Delta_CRVAL1"]) * 3600, t, p1(t) * 3600)
+    plt.title("RA error [arcsec]")
+    plt.grid()
+    plt.xlim(0, t.max())
+    txt = r"$\delta\,RA=%.3f$ arcsec/min" % (poly_d1[0] * 3600 * 60,)
+    y_pos = 0.20 if poly_d1[0] > 0 else 0.95
+    ax.text(0.55, y_pos, txt, transform=ax.transAxes,
+            fontsize=24, verticalalignment="top")
+
+    ax = fig.add_subplot(212)
+    plt.plot(t, np.array(sequence_df["Delta_CRVAL2"]) * 3600, t, p2(t) * 3600)
+    plt.title("DEC error [arcsec]")
+    plt.xlabel("time (in s)")
+    plt.grid()
+    plt.xlim(0, t.max())
+    txt = r"$\delta\,DEC=%.3f$ arcsec/min" % (poly_d2[0] * 3600 * 60,)
+    y_pos = 0.20 if poly_d2[0] > 0 else 0.95
+    ax.text(0.55, y_pos, txt, transform=ax.transAxes,
+            fontsize=24, verticalalignment="top")
+
+    _show_figure()
+
+
+def _ssa(x1, L, eigen_idx):
+    """Singular Spectrum Analysis (ported verbatim from v0p2).
+
+    Returns (reconstructed_component, residual, sorted_eigenvalues).
+
+    Based on Matlab code from F.J. Alonso Sanchez (Univ. of Extremadura)
+    improved by F. Auger (Nantes Univ.):
+    "The Sliding Singular Spectrum Analysis", IEEE TSP vol. 66 no. 1, 2018.
+    """
+    N = len(x1)
+    if L > N / 2:
+        L = N - L
+    K = N - L + 1
+
+    # Step 1: trajectory matrix
+    X = np.zeros((L, K))
+    for i in range(K):
+        X[:, i] = x1[i:L + i]
+
+    # Step 2: SVD
+    S = np.dot(X, X.T)
+    eigvals, eigvecs = LA.eig(S)
+    order = np.argsort(-np.real(eigvals))
+    d = np.real(eigvals)[order]
+    eigvecs = eigvecs[:, order]
+
+    V = np.dot(X.T, eigvecs)
+
+    # Step 3: grouping
+    rca = np.outer(eigvecs[:, eigen_idx], V.T[eigen_idx, :])
+
+    # Step 4: diagonal averaging (Hankelization)
+    y = np.zeros(N)
+    Lp, Kp = min(L, K), max(L, K)
+
+    for k in range(0, Lp - 1):
+        for m in range(0, k + 1):
+            y[k] += rca[m, k - m] / (k + 1)
+    for k in range(Lp - 1, Kp):
+        for m in range(0, Lp):
+            y[k] += rca[m, k - m] / Lp
+    for k in range(Kp, N):
+        for m in range(k + 1 - Kp, N - Kp + 1):
+            y[k] += rca[m, k - m] / (N - k)
+
+    return y, x1 - y, d
+
+
+def _my_fft(t, signal, Ts, plot, mark_all_components, tab_info, log):
+    """FFT of `signal`, optionally plot, return fundamental (amp, phase, f, T)."""
+    fourier = np.fft.fft(signal, FFT_N_POINTS)
+    freq = np.fft.fftfreq(FFT_N_POINTS, d=Ts)
+
+    spectre_amp = np.abs(fourier) / signal.size
+    save_dc = spectre_amp[0]
+    spectre_amp = 2 * spectre_amp
+    spectre_amp[0] = save_dc
+    spectre_phase = np.angle(fourier)
+
+    idx_fond = int(np.argmax(spectre_amp))
+    amp_fond   = spectre_amp[idx_fond]
+    phase_fond = spectre_phase[idx_fond]
+    freq_fond  = float(np.abs(freq[idx_fond]))
+    t_fond     = 1.0 / freq_fond if freq_fond > 0 else float("inf")
+
+    if plot:
+        xlim_f_min = 0.001
+        xlim_f_max = 1 / (Ts * 2)
+        xlim_t_min = 1 / xlim_f_max
+        xlim_t_max = 1 / xlim_f_min
+
+        fig = plt.figure(figsize=(12, 20))
+
+        plt.subplot(311)
+        plt.plot(t, signal)
+        plt.title("RA/CRVAL1 harmonic signal")
+        plt.grid()
+        plt.xlabel("time (in s)")
+        plt.xlim(0, t.max())
+
+        half = FFT_N_POINTS // 2 - 1
+
+        ax = fig.add_subplot(312)
+        plt.plot(freq[0:half], spectre_amp[0:half])
+        plt.title("fft spectrum")
+        plt.xlabel("frequency (Hz)")
+        plt.grid()
+        plt.xlim(xlim_f_min, xlim_f_max)
+
+        if not mark_all_components:
+            plt.axvline(x=freq_fond, color="red", linestyle="--")
+            txt = r"$F_{fond}=%.5f$Hz" % (freq_fond,)
+            ax.text(
+                (freq_fond - xlim_f_min) / (xlim_f_max - xlim_f_min) + 0.01,
+                0.95, txt, transform=ax.transAxes,
+                fontsize=12, verticalalignment="top",
+            )
+        else:
+            k = 0
+            for i in range(SSA_NB_EIGEN):
+                if tab_info[0, i] == 2:  # sinusoid pair
+                    plt.axvline(x=tab_info[3, i], color="red", linestyle="--")
+                    txt = r"$F=%.5f$Hz" % (tab_info[3, i],)
+                    ax.text(
+                        (tab_info[3, i] - xlim_f_min) / (xlim_f_max - xlim_f_min) + 0.01,
+                        0.95 - k * 0.05, txt, transform=ax.transAxes,
+                        fontsize=12, verticalalignment="top",
+                    )
+                    k += 1
+
+        ax = fig.add_subplot(313)
+        # Skip the DC bin (freq[0] == 0) — its period is infinite.
+        plt.plot(1 / freq[1:half], spectre_amp[1:half])
+        plt.title("fft spectrum")
+        plt.xlabel("time (s)")
+        plt.grid()
+        plt.xlim(xlim_t_min, xlim_t_max)
+
+        if not mark_all_components:
+            plt.axvline(x=t_fond, color="red", linestyle="--")
+            txt = r"$T_{fond}=%.2f$s" % (t_fond,)
+            ax.text(
+                (t_fond - xlim_t_min) / (xlim_t_max - xlim_t_min) + 0.01,
+                0.95, txt, transform=ax.transAxes,
+                fontsize=12, verticalalignment="top",
+            )
+        else:
+            k = 0
+            for i in range(SSA_NB_EIGEN):
+                if tab_info[0, i] == 2:
+                    plt.axvline(x=tab_info[4, i], color="red", linestyle="--")
+                    txt = r"$T=%.2f$s" % (tab_info[4, i],)
+                    ax.text(
+                        (tab_info[4, i] - xlim_t_min) / (xlim_t_max - xlim_t_min) + 0.01,
+                        0.95 - k * 0.05, txt, transform=ax.transAxes,
+                        fontsize=12, verticalalignment="top",
+                    )
+                    k += 1
+
+        _show_figure()
+
+    return amp_fond, phase_fond, freq_fond, t_fond
+
+
+def _ssa_analysis(sequence_df, log):
+    """SSA decomposition + FFT + reconstruction (ported from v0p2)."""
+    log("[PE] Starting Singular Spectrum Analysis (SSA)", color=LogColor.BLUE)
+
+    n = sequence_df["CRVAL1"].size
+    deg_to_arcsec = 3600
+    signal = (sequence_df["CRVAL1"] - sequence_df["CRVAL1"].iloc[0]) * deg_to_arcsec
+    signal = signal.to_numpy()
+
+    L = int(n / SSA_WINDOW_RATIO)
+    y = np.zeros((n, SSA_NB_EIGEN))
+    eigvals = None
+    for I in range(SSA_NB_EIGEN):
+        y[:, I], _, eigvals = _ssa(signal, L, I)
+
+    t = _time_axis(sequence_df)
+
+    # ---- Fig 3: raw RA error + normalized singular spectrum ----
+    fig = plt.figure(figsize=(12, 8))
+
+    fig.add_subplot(211)
+    plt.plot(t, signal, marker="+")
+    plt.title("RA error [arcsec]")
+    plt.xlabel("time (in s)")
+    plt.grid()
+    plt.xlim(0, t.max())
+
+    sev = float(np.sum(eigvals))
+    fig.add_subplot(212)
+    plt.plot(range(1, L + 1), eigvals / sev, marker="+")
+    plt.title("Normalized Singular Spectrum")
+    plt.xlabel("Eigenvalue Number")
+    plt.ylabel("fraction of energy")
+    plt.grid()
+    plt.xlim(1, 10)
+
+    _show_figure()
+
+    # ---- Group eigencomponents into fundamental + harmonics ----
+    tab_signal = np.zeros((n, SSA_NB_EIGEN))
+    # Row 0 of tab_info: 1 = single component, 2 = sinusoid pair
+    # Rows 1..4: amplitude, phase, frequency, period (filled by _my_fft)
+    tab_info = np.zeros((5, SSA_NB_EIGEN))
+
+    log("[PE] SSA component composition:")
+    k = 0
+    idx = 0
+    while idx <= SSA_GROUP_ORDER:
+        if eigvals[k + 1] < (1 - SSA_PAIR_THRESHOLD) * eigvals[k]:
+            tab_signal[:, idx] = y[:, k]
+            tab_info[0, idx] = 1
+            log(f"[PE]   {idx}: component {k}")
+            k += 1
+        else:
+            tab_signal[:, idx] = y[:, k] + y[:, k + 1]
+            tab_info[0, idx] = 2
+            log(f"[PE]   {idx}: components {k} + {k + 1} (sinusoid pair)")
+            k += 2
+        idx += 1
+
+    # ---- FFT on each sinusoidal component ----
+    Ts = float(np.mean(np.diff(t)))
+    log(f"[PE] Mean sampling period Ts = {Ts:.3f} s")
+
+    for i in range(SSA_GROUP_ORDER + 1):
+        if tab_info[0, i] == 2:
+            (tab_info[1, i],
+             tab_info[2, i],
+             tab_info[3, i],
+             tab_info[4, i]) = _my_fft(
+                t, tab_signal[:, i], Ts, PLOT_FFT_PER_COMP, False, tab_info, log,
+            )
+
+    # ---- Signal reconstruction + RMSE ----
+    signal_rebuilt = np.sum(tab_signal, axis=1)
+    err_signal = signal - signal_rebuilt
+
+    # Fundamental period for windowing the RMSE statistic
+    i = 0
+    while i < SSA_NB_EIGEN and tab_info[4, i] == 0:
+        i += 1
+    if i < SSA_NB_EIGEN:
+        T_fond = tab_info[4, i]
+    else:
+        T_fond = max(Ts * 2, 1e-6)
+
+    number_of_period = n * Ts / T_fond
+    n_periods_rms    = int(0.8 * number_of_period)
+    start_idx        = int(0.1 * n)
+    n_points         = int(n_periods_rms * T_fond / Ts)
+    # err_rms slice kept for diagnostic parity with v0p2 (unused below).
+    _ = err_signal[start_idx:start_idx + n_points - 1]
+    rmse = math.sqrt(float(np.square(err_signal).mean()))
+    log(f"[PE] RMS reconstruction error = {rmse:.3f} arcsec",
+        color=LogColor.GREEN)
+
+    # ---- Fig 4: original vs reconstructed + reconstruction error ----
+    fig = plt.figure(figsize=(12, 8))
+
+    fig.add_subplot(211)
+    plt.plot(t, signal, t, signal_rebuilt, marker="+")
+    plt.title("RA error and reconstructed signal [arcsec]")
+    plt.ylabel("[arcsec]")
+    plt.grid()
+    plt.xlim(0, t.max())
+
+    ax = fig.add_subplot(212)
+    plt.plot(t, err_signal, marker="+")
+    plt.title("Error of reconstruction")
+    plt.xlabel("time (in s)")
+    plt.ylabel("[arcsec]")
+    plt.grid()
+    plt.xlim(0, t.max())
+    ax.text(0.55, 0.95,
+            r" RMSE of reconstruction of the signal = %.3f arcsec" % (rmse,),
+            transform=ax.transAxes, fontsize=12, verticalalignment="top")
+
+    _show_figure()
+
+    # ---- Fig 5: main components stacked vertically ----
+    fig = plt.figure(figsize=(12, 20))
+    nrows = SSA_GROUP_ORDER + 1
+
+    # First subplot: the RA drift (1st grouped component)
+    poly_dev = np.polyfit(t, tab_signal[:, 0], 1)
+    title0 = (f"RA deviation - Slope = {poly_dev[0] * 60:.3f} arcsec/min "
+              f"between t=0 and t={t[n - 1]:.1f}s")
+    log(f"[PE] {title0}")
+    fig.add_subplot(nrows, 1, 1)
+    plt.plot(t, tab_signal[:, 0])
+    plt.title(title0)
+    plt.ylabel("[arcsec]")
+    plt.grid()
+    plt.xlim(0, t.max())
+
+    for k in range(1, SSA_GROUP_ORDER + 1):
+        window = tab_signal[start_idx:start_idx + n_points - 1, k]
+        max_v = float(np.max(window)) if window.size else 0.0
+        min_v = float(np.min(window)) if window.size else 0.0
+        rms_v = math.sqrt(float(np.square(window).mean())) if window.size else 0.0
+
+        if k == 1:
+            title = f"Max value of Fond = {max_v:.2f} arcsec"
+            log(f"[PE] Max value of Fond = {max_v:.2f} arcsec")
+            log(f"[PE] Min value of Fond = {min_v:.2f} arcsec")
+            log(f"[PE] RMS value of Fond = {rms_v:.2f} arcsec")
+        else:
+            title = f"Max value of H{k - 1} = {max_v:.2f} arcsec"
+            log(f"[PE] Max value of H{k - 1} = {max_v:.2f} arcsec")
+            log(f"[PE] Min value of H{k - 1} = {min_v:.2f} arcsec")
+            log(f"[PE] RMS value of H{k - 1} = {rms_v:.2f} arcsec")
+
+        fig.add_subplot(nrows, 1, k + 1)
+        plt.plot(t, tab_signal[:, k])
+        plt.title(title)
+        plt.ylabel("[arcsec]")
+        plt.grid()
+        plt.xlim(0, t.max())
+
+    plt.xlabel("time (in s)")
+    _show_figure()
+
+    # ---- Fig 6: FFT of the harmonic signal (full RA error minus linear drift)
+    poly_dev = np.polyfit(t, signal, 1)
+    ra_polynome = np.poly1d(poly_dev)
+    signal_fond = signal - ra_polynome(t)
+    _my_fft(t, signal_fond, Ts, True, True, tab_info, log)
+
+    log("[PE] End of Singular Spectrum Analysis (SSA)", color=LogColor.GREEN)
+
+
+# =============================================================================
+# Top-level driver
 # =============================================================================
 def compute_periodic_error(fits_files, first_idx, last_idx,
-                           use_astap, astap_cli, do_plate_solve):
-    """Compute the periodic error from the selected FITS frames.
+                           use_astap, astap_cli, do_plate_solve, log):
+    """Run the full PE pipeline on the selected FITS window.
 
-    TODO: plug in the existing macOS / Windows PE computation algorithm here.
-    The function should:
-      - optionally plate-solve each frame (ASTAP if use_astap else Siril/GAIA)
-      - extract RA/Dec for each frame and convert to drift in arcseconds
-      - fit the periodic drift over time
-      - emit a plot and a CSV of the residuals
+    The work is synchronous (the GUI freezes during ASTAP plate-solving on
+    large captures); progress is reported via Siril's log panel.
     """
-    raise NotImplementedError("PE algorithm not yet wired up.")
+    if not use_astap:
+        log(
+            "[PE] Plate-solving via Siril / GAIA is not yet implemented in "
+            "this script. Please select ASTAP, or run Siril's platesolve "
+            "manually beforehand and re-run with 'Run plate solve' off.",
+            color=LogColor.RED,
+        )
+        raise NotImplementedError("Siril/GAIA plate-solver not yet ported")
+
+    selected = fits_files[first_idx - 1:last_idx]
+    if not selected:
+        raise ValueError("No FITS files selected (check the index range)")
+
+    fits_folder = selected[0].parent
+    wcs_dir = fits_folder / WCS_SUBDIR_NAME
+
+    if do_plate_solve:
+        _plate_solve_astap(selected, astap_cli, wcs_dir, log)
+    elif not wcs_dir.exists():
+        raise FileNotFoundError(
+            f"Plate solve is off but no previous results exist at {wcs_dir}. "
+            "Enable 'Run plate solve' and try again."
+        )
+
+    sequence_df = _load_wcs_from_folder(wcs_dir, log)
+
+    # Constrain the analysis to the user-selected window. v0p2 always
+    # analysed from the first frame; the GUI now lets the user choose.
+    if len(sequence_df) > len(selected):
+        sequence_df = sequence_df.iloc[:len(selected)].copy()
+
+    _plot_plate_solve_data(sequence_df, log)
+    _ssa_analysis(sequence_df, log)
+    log("[PE] Analysis complete.", color=LogColor.GREEN)
 
 
 # =============================================================================
@@ -126,7 +746,11 @@ class PEAnalysisInterface:
             self.root.destroy()
             return
 
-        self.fits_files = sorted(self.working_dir.glob("*.fits"))
+        # Skip dotfiles (e.g. macOS '._*.fits' AppleDouble metadata that
+        # ASTAP can't parse — see `dot_clean` to remove them on disk).
+        self.fits_files = sorted(
+            p for p in self.working_dir.glob("*.fits") if not p.name.startswith(".")
+        )
         self.nb_fits = len(self.fits_files)
         if self.nb_fits == 0:
             self.siril.error_messagebox(
@@ -227,6 +851,10 @@ class PEAnalysisInterface:
         )
         ttk.Button(row, text="Browse...", command=browse_cmd).pack(side=tk.LEFT)
 
+    def _log(self, msg, color=LogColor.DEFAULT):
+        """Adapter so module-level helpers can call self.siril.log()."""
+        self.siril.log(msg, color=color)
+
     # ---------------------------------------------------------------- callbacks
     def _browse_astap_exe(self):
         path = filedialog.askopenfilename(
@@ -277,14 +905,16 @@ class PEAnalysisInterface:
             compute_periodic_error(
                 self.fits_files, t0, t_end, use_astap,
                 self.astap_path_var.get(), self.do_plate_solve_var.get(),
+                self._log,
             )
         except NotImplementedError as exc:
+            messagebox.showinfo("Not implemented", str(exc))
+        except FileNotFoundError as exc:
             self.siril.log(f"[PE] {exc}", color=LogColor.RED)
-            messagebox.showinfo(
-                "PE algorithm",
-                "The PE computation algorithm has not been wired up yet.\n"
-                "Plug it into compute_periodic_error() in this script.",
-            )
+            messagebox.showerror("File not found", str(exc))
+        except ValueError as exc:
+            self.siril.log(f"[PE] {exc}", color=LogColor.RED)
+            messagebox.showerror("Invalid input", str(exc))
         except SirilError as exc:
             self.siril.log(f"[PE] Siril error: {exc}", color=LogColor.RED)
             messagebox.showerror("Siril error", str(exc))
@@ -294,6 +924,7 @@ class PEAnalysisInterface:
             self.siril.disconnect()
         except SirilError:
             pass
+        plt.close("all")
         self.root.destroy()
 
 
