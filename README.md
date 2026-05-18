@@ -1,42 +1,40 @@
-# Periodic Error Analysis script in Python
+# Periodic Error Analysis
 
-## This script compute the Periodic Error of a mount based on a plate solve of fits file
+A [Siril](https://siril.org/) Python script that measures the **periodic error (PE)** of an equatorial telescope mount from a time series of FITS frames.
 
-* Version 0.1 : ![](PEC_Analysis_v0p1.py)
-  *   Plate solve using ASTAP 
-  *   Plate solve using PS3 is under development
+The pipeline plate-solves each frame with [ASTAP](https://www.hnsky.org/astap.htm), extracts the RA / DEC drift in arcseconds vs. time, then decomposes the RA error with **Singular Spectrum Analysis** and identifies the dominant periodic components (fundamental + harmonics) via FFT. Output is a set of matplotlib figures (raw RA/DEC, drift fit, singular spectrum, reconstructed signal, per-component statistics, full FFT) and a per-component log in Siril's log panel.
 
-  * Config.txt file : ![](config.txt)
-     * Add the path of ASTAP tool
-     * Example : 
-       astap,D:\ProgramOnD\astap\astap.exe
-       ps3,D:\ProgramOnD\Platesolve3_80\PlateSolve3.80.exe
+The SSA implementation is based on Alonso-Sanchez (Univ. of Extremadura) and Auger (Nantes Univ.), *"The Sliding Singular Spectrum Analysis: A Data-Driven Nonstationary Signal Decomposition Tool"*, IEEE TSP vol. 66 no. 1, January 2018.
 
-   * dir_fits_file.txt file : ![](dir_fits_file.txt)
-     * Add the path of the fits files to read
-     * tool,astap     : to using astap as plate solve tool
-     * platesolve_on  : ask a plate solve
-     * platesolve_off : no plate solve (because it has been yet done) and just
-                      a plot of the signal is ask
+## Requirements
 
-     * Example : 
-       dir_fits_file,D:\Documents\PEC_Analyse\File_Under_Test
-       tool,astap
-       platesolve_on, 
+- **Siril ≥ 1.3.6** (provides the Python interpreter and the `sirilpy` module).
+- **ASTAP** installed locally, used as the plate-solver CLI.
+- All Python dependencies (`numpy`, `pandas`, `matplotlib`, `astropy`, `unidecode`, `ttkthemes`) are auto-installed on first launch into Siril's bundled venv via `sirilpy.ensure_installed`.
 
-  * Comments : 
-    * Fig.1 is not well finished. The RA/CRVAL1 and DEC/CRVAL2 are in degree and 
-    not in "H:M:S" (hms) and "°:M:S" (dms)
-    
+## Usage
 
-*  Version 0.2 ![](PEC_Analysis_v0p2.py)
-    * Add a decomposition of the signal in principal components in order to have
-    an estimate of the frequency and amplitude of the main components and drift
+1. In Siril, **set the working directory** to the folder containing your PE capture FITS frames (folder icon in the main window, or `cd /path/to/fits` in the command bar).
+2. Launch the script from **Siril → Scripts** (or via Siril's Python script runner). It cannot be run with `python PE_Analysis.py` directly — it talks to a running Siril instance over IPC.
+3. In the GUI:
+   - Pick **ASTAP** as the plate-solver and browse to the ASTAP executable if the default path doesn't match. The path is persisted to `config_PE.txt` next to the script.
+   - Set the **begin / end frame indices** to constrain the analysis window. The window must contain at least **58 frames** — the Singular Spectrum Analysis stage extracts 10 eigencomponents, which requires the trajectory-matrix dimension `L = n / 5.71` to be ≥ 10. Narrower windows are rejected with a clear error.
+   - Toggle **Run plate solve** off to reuse the WCS results from a previous run (cached in a `PlateSolveAstap/` subfolder of your FITS directory).
+   - Click **Process**.
 
-* Coming next :
-    * Improve Fig. 1
-    * Add a plate solve with PS3
-    * Design a version only for SIRIL tool (plate solve with GAIA)
+Progress and per-component statistics (RA / DEC drift, mean sampling period, eigencomponent grouping, fundamental period and amplitude, harmonics min/max/RMS, reconstruction RMSE) stream to Siril's log panel. Plots open in separate matplotlib windows.
 
+## Limitations
 
+- **Siril / GAIA plate-solving** is not yet implemented — the radio is present but currently aborts with an explanatory message. Use ASTAP.
+- **Long captures freeze the GUI** during ASTAP plate-solving (processing is synchronous). Log messages still flow.
+- **macOS AppleDouble files** (`._*.fits`) are filtered out automatically.
 
+## License
+
+Distributed under [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)](https://creativecommons.org/licenses/by-nc-sa/4.0/).
+
+## Authors
+
+- Mickaël HILAIRET — LS2N / École Centrale de Nantes, France
+- Gilles MORAIN — France
