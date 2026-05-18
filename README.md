@@ -26,8 +26,7 @@ Progress and per-component statistics (RA / DEC drift, mean sampling period, eig
 
 ## Limitations
 
-- **Siril/GAIA path always re-solves** — cached reuse via the "Run plate solve" toggle is ASTAP-only for now (the Siril loop keeps WCS in memory and doesn't write sidecars).
-- **Siril/GAIA blind-solves** without focal-length / pixel-size hints, so it may be slower (or fail more often) than ASTAP on tricky frames. Hints can be added later from the FITS header if needed.
+- **Siril/GAIA path always re-solves** — cached reuse via the "Run plate solve" toggle is ASTAP-only for now (the Siril loop keeps WCS in memory and doesn't write sidecars). Focal-length and pixel-size hints (`FOCALLEN`, `XPIXSZ × XBINNING`) are passed to Siril's solver from the first frame's FITS header so the per-frame solve doesn't waste time on blind scale search.
 - **Long captures freeze the GUI** during plate-solving (processing is synchronous, on the Tk main thread). Log messages still flow.
 - **macOS AppleDouble files** (`._*.fits`) are filtered out automatically.
 
