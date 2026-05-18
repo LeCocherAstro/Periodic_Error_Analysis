@@ -65,6 +65,9 @@ SSA_GROUP_ORDER     = 5         # Fundamental + 5 harmonics
 SSA_PAIR_THRESHOLD  = 0.30      # Eigenvalue ratio under which two adjacent
                                 # components are merged as a sinusoid pair
 SSA_WINDOW_RATIO    = 5.71      # L = N / SSA_WINDOW_RATIO  (cf. v0p2)
+# Minimum number of plate-solved frames the SSA stage needs to extract
+# SSA_NB_EIGEN eigencomponents (L must be >= SSA_NB_EIGEN).
+SSA_MIN_FRAMES      = int(SSA_WINDOW_RATIO * SSA_NB_EIGEN) + 1
 FFT_N_POINTS        = 64 * 1024
 PLOT_FFT_PER_COMP   = True      # Plot FFT for every sinusoidal component
 
@@ -75,13 +78,19 @@ WCS_SUBDIR_NAME     = "PlateSolveAstap"
 # Config file helpers
 # =============================================================================
 def load_config():
-    """Read ASTAP and Siril CLI paths from config_PE.txt (or return defaults)."""
+    """Read ASTAP and Siril CLI paths from config_PE.txt.
+
+    If the file doesn't exist yet, write defaults so the user can later
+    edit it by hand instead of having to click Browse.
+    """
     paths = {"astap": DEFAULT_ASTAP_CLI, "siril": DEFAULT_SIRIL_CLI}
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE, newline="") as fp:
             for row in csv.reader(fp):
                 if len(row) == 2 and row[0] in paths:
                     paths[row[0]] = row[1]
+    else:
+        save_config(paths["astap"], paths["siril"])
     return paths
 
 
@@ -107,8 +116,14 @@ def _plate_solve_astap(fits_paths, astap_cli, wcs_dir, log):
 
     if wcs_dir.exists():
         log(f"[PE] Clearing previous results directory {wcs_dir}")
-        shutil.rmtree(wcs_dir)
-    wcs_dir.mkdir(parents=True)
+        # macOS exFAT/SMB volumes auto-remove `._*` AppleDouble companions
+        # when their sibling file is deleted, so rmtree can race against
+        # itself and hit ENOENT. Swallow only that case.
+        def _ignore_missing(func, path, exc_info):
+            if not isinstance(exc_info[1], FileNotFoundError):
+                raise exc_info[1]
+        shutil.rmtree(wcs_dir, onerror=_ignore_missing)
+    wcs_dir.mkdir(parents=True, exist_ok=True)
 
     n = len(fits_paths)
     log(f"[PE] Running ASTAP on {n} frames", color=LogColor.BLUE)
@@ -213,10 +228,17 @@ def _wcs_read_as_dict(wcs_file):
 
 def _load_wcs_from_folder(wcs_dir, log):
     """Load all .wcs files in wcs_dir into a DataFrame sorted by DATE-OBS."""
-    wcs_files = sorted(p for p in wcs_dir.glob("*.wcs") if p.is_file())
+    # Skip dotfiles (macOS `._*` AppleDouble shadows would parse as empty rows).
+    wcs_files = sorted(
+        p for p in wcs_dir.glob("*.wcs")
+        if p.is_file() and not p.name.startswith(".")
+    )
     log(f"[PE] Loading {len(wcs_files)} WCS files from {wcs_dir}")
     if not wcs_files:
-        raise FileNotFoundError(f"No .wcs files found in {wcs_dir}")
+        raise FileNotFoundError(
+            f"No usable .wcs files found in {wcs_dir}. "
+            "Re-run with 'Run plate solve' enabled to (re)populate the cache."
+        )
 
     records = [_wcs_read_as_dict(f) for f in wcs_files]
     df = pd.DataFrame.from_records(records)
@@ -490,6 +512,18 @@ def _ssa_analysis(sequence_df, log):
     log("[PE] Starting Singular Spectrum Analysis (SSA)", color=LogColor.BLUE)
 
     n = sequence_df["CRVAL1"].size
+
+    # SSA builds an L x L eigenvalue problem with L = n / SSA_WINDOW_RATIO,
+    # then asks for SSA_NB_EIGEN eigencomponents — so L must be >= that.
+    if n < SSA_MIN_FRAMES:
+        raise ValueError(
+            f"Singular Spectrum Analysis needs at least {SSA_MIN_FRAMES} "
+            f"successfully plate-solved frames to extract {SSA_NB_EIGEN} "
+            f"eigencomponents; only {n} are available. Widen the begin/end "
+            f"range, or check why ASTAP failed on so many frames (see the "
+            f"[k/N] solve log above)."
+        )
+
     deg_to_arcsec = 3600
     signal = (sequence_df["CRVAL1"] - sequence_df["CRVAL1"].iloc[0]) * deg_to_arcsec
     signal = signal.to_numpy()
@@ -811,18 +845,32 @@ class PEAnalysisInterface:
             row=1, column=0, sticky="e", padx=5, pady=2)
         begin_entry = ttk.Entry(proc_frame, textvariable=self.begin_index_var, width=10)
         begin_entry.grid(row=1, column=1, sticky="w", padx=5, pady=2)
-        tksiril.create_tooltip(begin_entry, f"First frame index (1..{self.nb_fits - 1}).")
+        tksiril.create_tooltip(
+            begin_entry,
+            f"First frame index (1..{self.nb_fits - 1}). "
+            f"The selected window must contain at least {SSA_MIN_FRAMES} frames.",
+        )
 
         ttk.Label(proc_frame, text="End index:").grid(
             row=2, column=0, sticky="e", padx=5, pady=2)
         end_entry = ttk.Entry(proc_frame, textvariable=self.end_index_var, width=10)
         end_entry.grid(row=2, column=1, sticky="w", padx=5, pady=2)
-        tksiril.create_tooltip(end_entry, f"Last frame index (2..{self.nb_fits}).")
+        tksiril.create_tooltip(
+            end_entry,
+            f"Last frame index (2..{self.nb_fits}). "
+            f"The selected window must contain at least {SSA_MIN_FRAMES} frames.",
+        )
+
+        ttk.Label(
+            proc_frame,
+            text=f"(SSA requires at least {SSA_MIN_FRAMES} frames in the window)",
+            foreground="gray",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 4))
 
         plate_solve_cb = ttk.Checkbutton(
             proc_frame, text="Run plate solve", variable=self.do_plate_solve_var,
         )
-        plate_solve_cb.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(8, 0))
+        plate_solve_cb.grid(row=4, column=0, columnspan=2, sticky="w", padx=5, pady=(8, 0))
         tksiril.create_tooltip(
             plate_solve_cb,
             "Disable to reuse plate-solving results from a previous run.",
@@ -884,6 +932,12 @@ class PEAnalysisInterface:
             return None, None, f"End index must be between 2 and {self.nb_fits}."
         if t0 >= t_end:
             return None, None, "Begin index must be strictly less than end index."
+        window = t_end - t0 + 1
+        if window < SSA_MIN_FRAMES:
+            return None, None, (
+                f"Selected window is only {window} frames; SSA needs at "
+                f"least {SSA_MIN_FRAMES}. Widen the begin/end range."
+            )
         return t0, t_end, None
 
     def _on_process(self):
