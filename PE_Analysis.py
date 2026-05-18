@@ -41,6 +41,7 @@ import pandas as pd                   # noqa: E402
 import matplotlib                     # noqa: E402
 import matplotlib.pyplot as plt       # noqa: E402
 from numpy import linalg as LA        # noqa: E402
+from astropy.io import fits as astrofits  # noqa: E402
 from astropy.time import Time         # noqa: E402
 from unidecode import unidecode       # noqa: E402
 
@@ -150,6 +151,40 @@ def _plate_solve_astap(fits_paths, astap_cli, wcs_dir, log):
     log("[PE] ASTAP plate-solving complete.", color=LogColor.GREEN)
 
 
+def _extract_platesolve_hints(fits_path, log):
+    """Read FOCALLEN (mm) and XPIXSZ (μm) from a FITS header to seed Siril's
+    blind solve. Returns a list of cmd args; empty if neither is available.
+
+    These are hints, not constraints — Siril still solves astrometrically
+    but converges much faster (and with fewer false negatives) when it has
+    a reasonable starting scale.
+    """
+    try:
+        header = astrofits.getheader(str(fits_path))
+    except Exception as exc:
+        log(f"[PE] Could not read header from {fits_path.name}: {exc} "
+            f"— blind solving", color=LogColor.BLUE)
+        return []
+
+    hints = []
+    focal = header.get("FOCALLEN")
+    if focal:
+        hints.append(f"-focal={float(focal):g}")
+    # Use XPIXSZ * XBINNING — Siril wants the effective pixel size on chip.
+    xpixsz = header.get("XPIXSZ")
+    xbin = header.get("XBINNING", 1) or 1
+    if xpixsz:
+        hints.append(f"-pixelsize={float(xpixsz) * int(xbin):g}")
+
+    if hints:
+        log(f"[PE] Platesolve hints from {fits_path.name}: {' '.join(hints)}",
+            color=LogColor.BLUE)
+    else:
+        log(f"[PE] No FOCALLEN/XPIXSZ in {fits_path.name} — blind solving",
+            color=LogColor.BLUE)
+    return hints
+
+
 def _plate_solve_siril(fits_paths, siril, log):
     """Solve each FITS via Siril's built-in GAIA solver, return a DataFrame.
 
@@ -162,6 +197,11 @@ def _plate_solve_siril(fits_paths, siril, log):
     n = len(fits_paths)
     log(f"[PE] Running Siril/GAIA plate-solver on {n} frames",
         color=LogColor.BLUE)
+
+    # All selected frames come from the same capture session, so the focal
+    # length and pixel size are constant — read once from the first frame.
+    hints = _extract_platesolve_hints(fits_paths[0], log)
+
     # Siril's text command parser splits arguments on whitespace and mangles
     # extensions on long absolute paths (e.g. ".fits" gets stripped to ".f"),
     # so cmd("load", abs_path) breaks on paths with spaces or many dots.
@@ -171,7 +211,7 @@ def _plate_solve_siril(fits_paths, siril, log):
         log(f"[PE]   [{i}/{n}] Solving {fits_path.name}")
         try:
             siril.cmd("load", fits_path.name)
-            siril.cmd("platesolve")
+            siril.cmd("platesolve", *hints)
             header = siril.get_image_fits_header(return_as="dict")
             records.append(header)
         except s.CommandError as exc:
