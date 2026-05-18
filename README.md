@@ -18,7 +18,7 @@ The SSA implementation is based on Alonso-Sanchez (Univ. of Extremadura) and Aug
 2. Launch the script from **Siril → Scripts** (or via Siril's Python script runner). It cannot be run with `python PE_Analysis.py` directly — it talks to a running Siril instance over IPC.
 3. In the GUI:
    - Pick **ASTAP** as the plate-solver and browse to the ASTAP executable if the default path doesn't match. The path is persisted to `config_PE.txt` next to the script.
-   - Set the **begin / end frame indices** to constrain the analysis window.
+   - Set the **begin / end frame indices** to constrain the analysis window. The window must contain at least **58 frames** — the Singular Spectrum Analysis stage extracts 10 eigencomponents, which requires the trajectory-matrix dimension `L = n / 5.71` to be ≥ 10. Narrower windows are rejected with a clear error.
    - Toggle **Run plate solve** off to reuse the WCS results from a previous run (cached in a `PlateSolveAstap/` subfolder of your FITS directory).
    - Click **Process**.
 
