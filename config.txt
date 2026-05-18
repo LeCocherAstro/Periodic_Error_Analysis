@@ -1,2 +1,0 @@
-astap,D:\ProgrammeFileSurD\astap\astap.exe
-ps3,D:\ProgrammeFileSurD\Platesolve3_80\PlateSolve3.80.exe
