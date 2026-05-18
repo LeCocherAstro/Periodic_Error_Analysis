@@ -4,13 +4,36 @@ A [Siril](https://siril.org/) Python script that measures the **periodic error (
 
 The pipeline plate-solves each frame with either [ASTAP](https://www.hnsky.org/astap.htm) (via the external CLI) or Siril's built-in GAIA-backed solver, extracts the RA / DEC drift in arcseconds vs. time, then decomposes the RA error with **Singular Spectrum Analysis** and identifies the dominant periodic components (fundamental + harmonics) via FFT. Output is a set of matplotlib figures (raw RA/DEC, drift fit, singular spectrum, reconstructed signal, per-component statistics, full FFT) and a per-component log in Siril's log panel.
 
+```mermaid
+flowchart LR
+    A[FITS frames<br/>from NINA / SGP / etc.] --> B{Plate-solve}
+    B -->|ASTAP CLI| C[.wcs sidecars<br/>in PlateSolveAstap/]
+    B -->|Siril GAIA| D[FITS headers<br/>read in-memory]
+    C --> E[Pandas DataFrame<br/>CRVAL1 / CRVAL2 / DATE-OBS]
+    D --> E
+    E --> F[RA drift signal<br/>arcsec vs. time]
+    F --> G[SSA decomposition<br/>10 eigencomponents]
+    G --> H[FFT per component<br/>periods &amp; amplitudes]
+    H --> I[Matplotlib figures<br/>+ stats in Siril log]
+```
+
 The SSA implementation is based on Alonso-Sanchez (Univ. of Extremadura) and Auger (Nantes Univ.), *"The Sliding Singular Spectrum Analysis: A Data-Driven Nonstationary Signal Decomposition Tool"*, IEEE TSP vol. 66 no. 1, January 2018.
+
+## Example output
+
+Two of the synthesis figures the script produces (also embedded in the optional PDF report) — the dominant periodicities identified by the SSA + FFT pipeline, and how well a sum of those components reconstructs the original RA error signal:
+
+| FFT with SSA-identified periods | Signal reconstruction |
+|---|---|
+| ![FFT with marked periods](docs/figures/fft_with_markers.png) | ![Reconstruction and residual](docs/figures/reconstruction.png) |
+
+*Left:* the detrended RA error's full FFT, with red dashed lines at the fundamental and each harmonic period recovered by SSA — the visual fingerprint of the worm gear's error signature. *Right:* the original signal overlaid with the SSA reconstruction (top), and the residual after subtraction (bottom) annotated with its RMS — what's left after periodic and secular components have been removed is the seeing / wind / guiding noise floor that PEC cannot correct.
 
 ## Requirements
 
 - **Siril ≥ 1.3.6** (provides the Python interpreter and the `sirilpy` module).
 - **A plate-solver**: either ASTAP installed locally, or Siril's built-in GAIA solver (no extra install — the catalog is fetched on first use).
-- All Python dependencies (`numpy`, `pandas`, `matplotlib`, `astropy`, `unidecode`, `ttkthemes`) are auto-installed on first launch into Siril's bundled venv via `sirilpy.ensure_installed`.
+- All Python dependencies (`numpy`, `pandas`, `matplotlib`, `astropy`, `unidecode`, `ttkthemes`, `reportlab`) are auto-installed on first launch into Siril's bundled venv via `sirilpy.ensure_installed`. `reportlab` is only used when the optional PDF report is enabled.
 
 ## Usage
 
@@ -20,9 +43,10 @@ The SSA implementation is based on Alonso-Sanchez (Univ. of Extremadura) and Aug
    - Pick a plate-solver: **ASTAP** (browse to the executable if the default path doesn't match) or **SIRIL (GAIA)** (no path needed — Siril's built-in solver runs in-process). The selected paths are persisted to `config_PE.txt` next to the script.
    - Set the **begin / end frame indices** to constrain the analysis window. The window must contain at least **58 frames** — the Singular Spectrum Analysis stage extracts 10 eigencomponents, which requires the trajectory-matrix dimension `L = n / 5.71` to be ≥ 10. Narrower windows are rejected with a clear error.
    - Toggle **Run plate solve** off to reuse the WCS results from a previous **ASTAP** run (cached in a `PlateSolveAstap/` subfolder of your FITS directory). The Siril/GAIA path does not cache — it always re-solves, so this toggle must stay enabled when SIRIL is selected.
+   - (Optional) In the **Report** section, edit the title (auto-populated from the FITS `OBJECT` keyword or the folder name) and tick **Save PDF report** to write a multi-page PDF with cover, methodology, results and discussion next to the FITS folder.
    - Click **Process**.
 
-Progress and per-component statistics (RA / DEC drift, mean sampling period, eigencomponent grouping, fundamental period and amplitude, harmonics min/max/RMS, reconstruction RMSE) stream to Siril's log panel. Plots open in separate matplotlib windows.
+Progress and per-component statistics (RA / DEC drift, mean sampling period, eigencomponent grouping, fundamental period and amplitude, harmonics min/max/RMS, reconstruction RMSE) stream to Siril's log panel. Plots open in separate matplotlib windows. When the **Save PDF report** option is enabled, a self-contained `<folder>_PE_report_<timestamp>.pdf` is also written next to the FITS folder — useful for archiving a definitive result or sharing with collaborators.
 
 ## Limitations
 
