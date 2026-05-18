@@ -23,14 +23,24 @@ https://siril.readthedocs.io/en/stable/scripts/python_gui_template
 # Core module imports
 import csv
 import math
+import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, messagebox
 
 import sirilpy as s
 from sirilpy import tksiril, LogColor, SirilError, SirilConnectionError
+
+# Use Siril's nicer tkfilebrowser on Linux when available — the stock Tk
+# file picker is dated and inconsistent with the rest of the Siril UI.
+# macOS and Windows already get native dialogs from tkinter.filedialog.
+if sys.platform.startswith("linux") and s.check_module_version(">=0.6.47"):
+    import sirilpy.tkfilebrowser as filedialog  # noqa: E402
+else:
+    from tkinter import filedialog  # noqa: E402
 
 # Ensure non-core modules are available in Siril's venv before importing them
 s.ensure_installed("ttkthemes", "numpy", "pandas", "matplotlib", "astropy",
@@ -59,8 +69,22 @@ AUTHORS        = "Mickaël HILAIRET and Gilles MORAIN"
 VERSION        = "0.5.0"
 REQUIRED_SIRIL = "1.3.6"
 
-DEFAULT_ASTAP_CLI = "/Applications/ASTAP.app/Contents/MacOS/astap"
-DEFAULT_SIRIL_CLI = "/Applications/Siril.app/Contents/MacOS/siril-cli"
+# Platform-specific default paths to the ASTAP and Siril CLI executables.
+# Used only as a first-launch seed for the file pickers — the user's choices
+# are persisted to config_PE.txt and override these on subsequent runs.
+if sys.platform == "darwin":
+    DEFAULT_ASTAP_CLI = "/Applications/ASTAP.app/Contents/MacOS/astap"
+    DEFAULT_SIRIL_CLI = "/Applications/Siril.app/Contents/MacOS/siril-cli"
+elif sys.platform.startswith("win"):
+    DEFAULT_ASTAP_CLI = r"C:\Program Files\astap\astap.exe"
+    DEFAULT_SIRIL_CLI = r"C:\Program Files\Siril\bin\siril-cli.exe"
+else:  # Linux and other POSIX
+    DEFAULT_ASTAP_CLI = "/usr/bin/astap"
+    DEFAULT_SIRIL_CLI = "/usr/bin/siril-cli"
+
+# FITS files come in several extensions; some capture software writes
+# uppercase on Linux/case-sensitive volumes, so match case-insensitively.
+FITS_SUFFIXES = {".fits", ".fit", ".fts"}
 
 SCRIPT_DIR  = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "config_PE.txt"
@@ -83,6 +107,20 @@ WCS_SUBDIR_NAME     = "PlateSolveAstap"
 # =============================================================================
 # Config file helpers
 # =============================================================================
+def _sanitize_filename(name):
+    """Strip characters illegal in filenames on Windows / POSIX.
+
+    Windows reserves <>:"/\\|?* and ASCII control characters; trailing
+    dots/spaces are also rejected. Collapse whitespace runs into single
+    underscores so the result reads cleanly. Empty result falls back to
+    "report".
+    """
+    sanitized = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    sanitized = re.sub(r"\s+", "_", sanitized)
+    sanitized = sanitized.rstrip(". ")
+    return sanitized or "report"
+
+
 def load_config():
     """Read ASTAP and Siril CLI paths from config_PE.txt.
 
@@ -370,10 +408,13 @@ def _finalize_sequence_df(df):
 
 def _load_wcs_from_folder(wcs_dir, log):
     """Load all .wcs files in wcs_dir into a DataFrame sorted by DATE-OBS."""
-    # Skip dotfiles (macOS `._*` AppleDouble shadows would parse as empty rows).
+    # Case-insensitive suffix match; skip dotfiles (macOS `._*` AppleDouble
+    # shadows on exFAT/SMB would parse as empty rows).
     wcs_files = sorted(
-        p for p in wcs_dir.glob("*.wcs")
-        if p.is_file() and not p.name.startswith(".")
+        p for p in wcs_dir.iterdir()
+        if p.is_file()
+        and p.suffix.lower() == ".wcs"
+        and not p.name.startswith(".")
     )
     log(f"[PE] Loading {len(wcs_files)} WCS files from {wcs_dir}")
     if not wcs_files:
@@ -981,14 +1022,14 @@ def _build_pdf_report(out_path, *,
     _add_meta("Focal length",  capture_metadata.get("focal_length"),
               lambda v: f"{float(v):g} mm")
     _add_meta("Pixel size",    capture_metadata.get("pixel_size"),
-              lambda v: f"{float(v):g} μm")
+              lambda v: f"{float(v):g} um")
     _add_meta("Binning",       capture_metadata.get("binning"),
-              lambda v: f"{int(v)}×{int(v)}")
+              lambda v: f"{int(v)}x{int(v)}")
     _add_meta("Exposure",      capture_metadata.get("exposure"),
               lambda v: f"{float(v):g} s")
     _add_meta("Gain",          capture_metadata.get("gain"))
     _add_meta("CCD temp",      capture_metadata.get("ccd_temp"),
-              lambda v: f"{float(v):g} °C")
+              lambda v: f"{float(v):g} degC")
     _add_meta("Observer",      capture_metadata.get("observer"))
 
     meta_rows.append(["Plate-solver", solver])
@@ -1282,7 +1323,7 @@ def compute_periodic_error(fits_files, first_idx, last_idx,
                                or fits_folder.name)
         from datetime import datetime
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_name = fits_folder.name.replace(" ", "_").replace("/", "_")
+        safe_name = _sanitize_filename(fits_folder.name)
         out_path = fits_folder / f"{safe_name}_PE_report_{stamp}.pdf"
         log(f"[PE] Building PDF report at {out_path}", color=LogColor.BLUE)
         merged_figures = {**drift_result["figures"], **ssa_result["figures"]}
@@ -1343,10 +1384,14 @@ class PEAnalysisInterface:
             self.root.destroy()
             return
 
-        # Skip dotfiles (e.g. macOS '._*.fits' AppleDouble metadata that
-        # ASTAP can't parse — see `dot_clean` to remove them on disk).
+        # Discover FITS files: case-insensitive on suffix (Linux ext4 cares),
+        # accepting .fits/.fit/.fts, and skipping dotfiles (e.g. macOS
+        # '._*.fits' AppleDouble metadata — see `dot_clean` to clean disk).
         self.fits_files = sorted(
-            p for p in self.working_dir.glob("*.fits") if not p.name.startswith(".")
+            p for p in self.working_dir.iterdir()
+            if p.is_file()
+            and p.suffix.lower() in FITS_SUFFIXES
+            and not p.name.startswith(".")
         )
         self.nb_fits = len(self.fits_files)
         if self.nb_fits == 0:
