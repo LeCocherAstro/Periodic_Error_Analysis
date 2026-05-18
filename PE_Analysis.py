@@ -41,6 +41,7 @@ import pandas as pd                   # noqa: E402
 import matplotlib                     # noqa: E402
 import matplotlib.pyplot as plt       # noqa: E402
 from numpy import linalg as LA        # noqa: E402
+from astropy.io import fits as astrofits  # noqa: E402
 from astropy.time import Time         # noqa: E402
 from unidecode import unidecode       # noqa: E402
 
@@ -150,6 +151,87 @@ def _plate_solve_astap(fits_paths, astap_cli, wcs_dir, log):
     log("[PE] ASTAP plate-solving complete.", color=LogColor.GREEN)
 
 
+def _extract_platesolve_hints(fits_path, log):
+    """Read FOCALLEN (mm) and XPIXSZ (μm) from a FITS header to seed Siril's
+    blind solve. Returns a list of cmd args; empty if neither is available.
+
+    These are hints, not constraints — Siril still solves astrometrically
+    but converges much faster (and with fewer false negatives) when it has
+    a reasonable starting scale.
+    """
+    try:
+        header = astrofits.getheader(str(fits_path))
+    except Exception as exc:
+        log(f"[PE] Could not read header from {fits_path.name}: {exc} "
+            f"— blind solving", color=LogColor.BLUE)
+        return []
+
+    hints = []
+    focal = header.get("FOCALLEN")
+    if focal:
+        hints.append(f"-focal={float(focal):g}")
+    # Use XPIXSZ * XBINNING — Siril wants the effective pixel size on chip.
+    xpixsz = header.get("XPIXSZ")
+    xbin = header.get("XBINNING", 1) or 1
+    if xpixsz:
+        hints.append(f"-pixelsize={float(xpixsz) * int(xbin):g}")
+
+    if hints:
+        log(f"[PE] Platesolve hints from {fits_path.name}: {' '.join(hints)}",
+            color=LogColor.BLUE)
+    else:
+        log(f"[PE] No FOCALLEN/XPIXSZ in {fits_path.name} — blind solving",
+            color=LogColor.BLUE)
+    return hints
+
+
+def _plate_solve_siril(fits_paths, siril, log):
+    """Solve each FITS via Siril's built-in GAIA solver, return a DataFrame.
+
+    Per-frame loop — slower than seqplatesolve but simpler to reason about
+    (matches the ASTAP path's per-frame progress / failure logging). The
+    WCS solution lives only in Siril's in-memory image buffer; nothing is
+    written to disk, so there is no cache to reuse on subsequent runs.
+    """
+    records = []
+    n = len(fits_paths)
+    log(f"[PE] Running Siril/GAIA plate-solver on {n} frames",
+        color=LogColor.BLUE)
+
+    # All selected frames come from the same capture session, so the focal
+    # length and pixel size are constant — read once from the first frame.
+    hints = _extract_platesolve_hints(fits_paths[0], log)
+
+    # Siril's text command parser splits arguments on whitespace and mangles
+    # extensions on long absolute paths (e.g. ".fits" gets stripped to ".f"),
+    # so cmd("load", abs_path) breaks on paths with spaces or many dots.
+    # Fall back to bare filenames — Siril's working directory is already the
+    # FITS folder (the script discovered the .fits files there at startup).
+    for i, fits_path in enumerate(fits_paths, 1):
+        log(f"[PE]   [{i}/{n}] Solving {fits_path.name}")
+        try:
+            siril.cmd("load", fits_path.name)
+            siril.cmd("platesolve", *hints)
+            header = siril.get_image_fits_header(return_as="dict")
+            records.append(header)
+        except s.CommandError as exc:
+            log(f"[PE]     platesolve failed for {fits_path.name}: {exc}",
+                color=LogColor.RED)
+        except SirilError as exc:
+            log(f"[PE]     Siril error for {fits_path.name}: {exc}",
+                color=LogColor.RED)
+
+    if not records:
+        raise RuntimeError(
+            "Siril platesolve produced no results — every frame failed. "
+            "Check the per-frame error messages in the log above."
+        )
+
+    log(f"[PE] Siril plate-solving complete ({len(records)}/{n} solved).",
+        color=LogColor.GREEN)
+    return _finalize_sequence_df(pd.DataFrame.from_records(records))
+
+
 # =============================================================================
 # WCS parsing
 # =============================================================================
@@ -226,6 +308,24 @@ def _wcs_read_as_dict(wcs_file):
     return d
 
 
+def _finalize_sequence_df(df):
+    """Index by DATE-OBS, sort, and add FRAME_NUM / TIME_DIFF / TIME_REL columns.
+
+    Shared by both the ASTAP (load-from-.wcs-files) and Siril/GAIA
+    (read-from-in-memory-headers) paths so they produce identical shapes.
+    """
+    if "DATE-OBS" in df.columns:
+        df["DATE-OBS"] = pd.to_datetime(df["DATE-OBS"], errors="coerce")
+        df.set_index("DATE-OBS", drop=False, inplace=True)
+        df.sort_index(inplace=True)
+        df["FRAME_NUM"] = df.reset_index(drop=True).index.values
+        df["TIME_DIFF"] = df["DATE-OBS"].diff().dt.total_seconds()
+        df["TIME_REL"] = (
+            df["DATE-OBS"] - df["DATE-OBS"].min()
+        ).dt.total_seconds()
+    return df
+
+
 def _load_wcs_from_folder(wcs_dir, log):
     """Load all .wcs files in wcs_dir into a DataFrame sorted by DATE-OBS."""
     # Skip dotfiles (macOS `._*` AppleDouble shadows would parse as empty rows).
@@ -241,19 +341,7 @@ def _load_wcs_from_folder(wcs_dir, log):
         )
 
     records = [_wcs_read_as_dict(f) for f in wcs_files]
-    df = pd.DataFrame.from_records(records)
-
-    if "DATE-OBS" in df.columns:
-        df["DATE-OBS"] = pd.to_datetime(df["DATE-OBS"], errors="coerce")
-        df.set_index("DATE-OBS", drop=False, inplace=True)
-        df.sort_index(inplace=True)
-        df["FRAME_NUM"] = df.reset_index(drop=True).index.values
-        df["TIME_DIFF"] = df["DATE-OBS"].diff().dt.total_seconds()
-        df["TIME_REL"] = (
-            df["DATE-OBS"] - df["DATE-OBS"].min()
-        ).dt.total_seconds()
-
-    return df
+    return _finalize_sequence_df(pd.DataFrame.from_records(records))
 
 
 def _time_axis(sequence_df):
@@ -694,37 +782,39 @@ def _ssa_analysis(sequence_df, log):
 # Top-level driver
 # =============================================================================
 def compute_periodic_error(fits_files, first_idx, last_idx,
-                           use_astap, astap_cli, do_plate_solve, log):
+                           use_astap, astap_cli, siril,
+                           do_plate_solve, log):
     """Run the full PE pipeline on the selected FITS window.
 
-    The work is synchronous (the GUI freezes during ASTAP plate-solving on
-    large captures); progress is reported via Siril's log panel.
+    The work is synchronous (the GUI freezes during plate-solving on large
+    captures); progress is reported via Siril's log panel.
     """
-    if not use_astap:
-        log(
-            "[PE] Plate-solving via Siril / GAIA is not yet implemented in "
-            "this script. Please select ASTAP, or run Siril's platesolve "
-            "manually beforehand and re-run with 'Run plate solve' off.",
-            color=LogColor.RED,
-        )
-        raise NotImplementedError("Siril/GAIA plate-solver not yet ported")
-
     selected = fits_files[first_idx - 1:last_idx]
     if not selected:
         raise ValueError("No FITS files selected (check the index range)")
 
-    fits_folder = selected[0].parent
-    wcs_dir = fits_folder / WCS_SUBDIR_NAME
+    if use_astap:
+        fits_folder = selected[0].parent
+        wcs_dir = fits_folder / WCS_SUBDIR_NAME
 
-    if do_plate_solve:
-        _plate_solve_astap(selected, astap_cli, wcs_dir, log)
-    elif not wcs_dir.exists():
-        raise FileNotFoundError(
-            f"Plate solve is off but no previous results exist at {wcs_dir}. "
-            "Enable 'Run plate solve' and try again."
-        )
+        if do_plate_solve:
+            _plate_solve_astap(selected, astap_cli, wcs_dir, log)
+        elif not wcs_dir.exists():
+            raise FileNotFoundError(
+                f"Plate solve is off but no previous results exist at "
+                f"{wcs_dir}. Enable 'Run plate solve' and try again."
+            )
 
-    sequence_df = _load_wcs_from_folder(wcs_dir, log)
+        sequence_df = _load_wcs_from_folder(wcs_dir, log)
+    else:
+        # Siril/GAIA path: in-memory only, so there is no cache to reuse.
+        if not do_plate_solve:
+            raise ValueError(
+                "The Siril/GAIA path does not support cached reuse in this "
+                "version. Enable 'Run plate solve', or select ASTAP for "
+                "cached re-runs."
+            )
+        sequence_df = _plate_solve_siril(selected, siril, log)
 
     # Constrain the analysis to the user-selected window. v0p2 always
     # analysed from the first frame; the GUI now lets the user choose.
@@ -826,10 +916,16 @@ class PEAnalysisInterface:
         self._build_solver_row(
             tools_frame, "ASTAP", self.PLATE_SOLVER_ASTAP,
             self.astap_path_var, self._browse_astap_exe,
+            tooltip=("Plate-solve via the external ASTAP CLI. Writes .wcs "
+                     "sidecars to PlateSolveAstap/ so 'Run plate solve' "
+                     "can be unticked on subsequent runs to skip ASTAP."),
         )
         self._build_solver_row(
             tools_frame, "SIRIL (GAIA)", self.PLATE_SOLVER_SIRIL,
             self.siril_path_var, self._browse_siril_exe,
+            tooltip=("Plate-solve via Siril's built-in GAIA solver. "
+                     "Works without ASTAP installed, but re-solves every "
+                     "run — 'Run plate solve' must stay enabled."),
         )
 
         # Processing parameters frame
@@ -888,12 +984,16 @@ class PEAnalysisInterface:
         close_btn.pack(side=tk.LEFT, padx=5)
         tksiril.create_tooltip(close_btn, "Close the script (no changes to images).")
 
-    def _build_solver_row(self, parent, label, value, path_var, browse_cmd):
+    def _build_solver_row(self, parent, label, value, path_var, browse_cmd,
+                          tooltip=None):
         row = ttk.Frame(parent)
         row.pack(fill=tk.X, pady=2)
-        ttk.Radiobutton(
+        radio = ttk.Radiobutton(
             row, text=label, variable=self.solver_var, value=value, width=14,
-        ).pack(side=tk.LEFT)
+        )
+        radio.pack(side=tk.LEFT)
+        if tooltip:
+            tksiril.create_tooltip(radio, tooltip)
         ttk.Entry(row, textvariable=path_var, width=50).pack(
             side=tk.LEFT, padx=5, fill=tk.X, expand=True,
         )
@@ -958,17 +1058,19 @@ class PEAnalysisInterface:
         try:
             compute_periodic_error(
                 self.fits_files, t0, t_end, use_astap,
-                self.astap_path_var.get(), self.do_plate_solve_var.get(),
+                self.astap_path_var.get(), self.siril,
+                self.do_plate_solve_var.get(),
                 self._log,
             )
-        except NotImplementedError as exc:
-            messagebox.showinfo("Not implemented", str(exc))
         except FileNotFoundError as exc:
             self.siril.log(f"[PE] {exc}", color=LogColor.RED)
             messagebox.showerror("File not found", str(exc))
         except ValueError as exc:
             self.siril.log(f"[PE] {exc}", color=LogColor.RED)
             messagebox.showerror("Invalid input", str(exc))
+        except RuntimeError as exc:
+            self.siril.log(f"[PE] {exc}", color=LogColor.RED)
+            messagebox.showerror("Plate solve failed", str(exc))
         except SirilError as exc:
             self.siril.log(f"[PE] Siril error: {exc}", color=LogColor.RED)
             messagebox.showerror("Siril error", str(exc))
