@@ -66,7 +66,7 @@ from unidecode import unidecode       # noqa: E402
 # =============================================================================
 APP_NAME       = "Automatic Periodic Error Computation"
 AUTHORS        = "Mickaël HILAIRET and Gilles MORAIN"
-VERSION        = "0.5.1"
+VERSION        = "0.6.0"
 REQUIRED_SIRIL = "1.3.6"
 
 # Platform-specific default paths to the ASTAP and Siril CLI executables.
@@ -440,6 +440,101 @@ def _time_axis(sequence_df):
     raise ValueError("Neither DATE-LOC nor DATE-OBS available in WCS data")
 
 
+def _format_seconds(value):
+    """Render a seconds value for the log / PDF table.
+
+    None / non-finite / NaN  -> ``"n/a"``
+    very large (>10 000 s)   -> ``"> long capture"``
+    < 10 s                   -> 1-decimal seconds
+    otherwise                -> integer seconds
+    """
+    if value is None:
+        return "n/a"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if not math.isfinite(v):
+        return "> long capture"
+    if v > 1e4:
+        return "> long capture"
+    if v < 10:
+        return f"{v:.1f} s"
+    return f"{v:.0f} s"
+
+
+def _compute_pixel_scale(sequence_df, override_arcsec_per_pixel, log):
+    """Resolve the per-axis pixel scale (arcsec/pixel) from the plate-solve.
+
+    Tries, in order: user override (both axes), CD matrix, CDELT1/CDELT2,
+    and finally FOCALLEN + XPIXSZ. Per-frame values are reduced by the
+    median to be robust to occasional outliers. Returns a dict with
+    ``ra_arcsec_per_pixel``, ``dec_arcsec_per_pixel`` and ``source``.
+    Returns ``None`` if no source could be resolved.
+    """
+    if override_arcsec_per_pixel is not None:
+        v = float(override_arcsec_per_pixel)
+        log(f"[PE] Pixel scale: {v:.3f} arcsec/pixel (source: override)")
+        return {"ra_arcsec_per_pixel": v,
+                "dec_arcsec_per_pixel": v,
+                "source": "override"}
+
+    def _finite_median(series):
+        arr = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return None
+        return float(np.median(arr))
+
+    # CD matrix: arcsec/pixel along each image axis
+    cd_cols = ("CD1_1", "CD1_2", "CD2_1", "CD2_2")
+    if all(c in sequence_df.columns for c in cd_cols):
+        c11 = _finite_median(sequence_df["CD1_1"])
+        c12 = _finite_median(sequence_df["CD1_2"])
+        c21 = _finite_median(sequence_df["CD2_1"])
+        c22 = _finite_median(sequence_df["CD2_2"])
+        if None not in (c11, c12, c21, c22):
+            scale_x = 3600.0 * math.sqrt(c11 * c11 + c21 * c21)
+            scale_y = 3600.0 * math.sqrt(c12 * c12 + c22 * c22)
+            if scale_x > 0 and scale_y > 0:
+                log(f"[PE] Pixel scale: {scale_x:.3f} / {scale_y:.3f} "
+                    f"arcsec/pixel (source: CD matrix)")
+                return {"ra_arcsec_per_pixel": scale_x,
+                        "dec_arcsec_per_pixel": scale_y,
+                        "source": "CD"}
+
+    # CDELT1 / CDELT2 in degrees/pixel
+    if "CDELT1" in sequence_df.columns and "CDELT2" in sequence_df.columns:
+        d1 = _finite_median(sequence_df["CDELT1"])
+        d2 = _finite_median(sequence_df["CDELT2"])
+        if d1 is not None and d2 is not None:
+            scale_x = abs(d1) * 3600.0
+            scale_y = abs(d2) * 3600.0
+            if scale_x > 0 and scale_y > 0:
+                log(f"[PE] Pixel scale: {scale_x:.3f} / {scale_y:.3f} "
+                    f"arcsec/pixel (source: CDELT)")
+                return {"ra_arcsec_per_pixel": scale_x,
+                        "dec_arcsec_per_pixel": scale_y,
+                        "source": "CDELT"}
+
+    # FOCALLEN (mm) + XPIXSZ (µm). 206.265 = (180/π) × 3600 / 1000.
+    if ("FOCALLEN" in sequence_df.columns
+            and "XPIXSZ" in sequence_df.columns):
+        focal = _finite_median(sequence_df["FOCALLEN"])
+        pix_um = _finite_median(sequence_df["XPIXSZ"])
+        if focal and pix_um and focal > 0:
+            scale = 206.265 * pix_um / focal
+            log(f"[PE] Pixel scale: {scale:.3f} arcsec/pixel "
+                f"(source: FOCALLEN+XPIXSZ)")
+            return {"ra_arcsec_per_pixel": scale,
+                    "dec_arcsec_per_pixel": scale,
+                    "source": "FOCALLEN"}
+
+    log("[PE] Pixel scale: could not resolve from headers — "
+        "max-exposure-time section will be omitted", color=LogColor.SALMON)
+    return None
+
+
 # =============================================================================
 # Plotting & analysis
 # =============================================================================
@@ -705,6 +800,71 @@ def _my_fft(t, signal, Ts, plot, mark_all_components, tab_info, log):
     return amp_fond, phase_fond, freq_fond, t_fond, fig
 
 
+def _max_exposure_time(t, signal_arcsec, pixel_scale_arcsec):
+    """Estimate the longest exposure window keeping drift+PE under one pixel.
+
+    Returns a dict with three complementary estimates (all in seconds):
+
+    - ``linear_s``         pixel / |least-squares slope| (long-term drift only)
+    - ``instantaneous_s``  pixel / max |dsignal/dt|     (worst-case slew rate)
+    - ``sliding_window_s`` largest window whose peak-to-peak ≤ one pixel
+
+    Plus ``binding`` (the name of the smallest finite estimate),
+    ``duration_s`` (observation window), and ``saturated`` (True if the
+    whole capture never exceeds one pixel, so ``sliding_window_s`` is
+    pinned at the duration). Pure function — no logging.
+    """
+    t = np.asarray(t, dtype=float)
+    s = np.asarray(signal_arcsec, dtype=float)
+    n = s.size
+    duration = float(t[-1] - t[0]) if n > 1 else 0.0
+    out = {"linear_s": None, "instantaneous_s": None,
+           "sliding_window_s": None, "binding": None,
+           "duration_s": duration, "saturated": False}
+    if n < 2 or duration <= 0 or pixel_scale_arcsec is None \
+            or pixel_scale_arcsec <= 0:
+        return out
+    px = float(pixel_scale_arcsec)
+    Ts = duration / (n - 1)
+
+    slope = float(np.polyfit(t, s, 1)[0])
+    out["linear_s"] = px / abs(slope) if abs(slope) > 1e-12 else float("inf")
+
+    max_slope = float(np.max(np.abs(np.gradient(s, t))))
+    out["instantaneous_s"] = (px / max_slope if max_slope > 1e-12
+                              else float("inf"))
+
+    def pp_for_k(k):
+        if k < 2:
+            return 0.0
+        if k >= n:
+            return float(s.max() - s.min())
+        win = np.lib.stride_tricks.sliding_window_view(s, k)
+        return float(np.max(win.max(axis=-1) - win.min(axis=-1)))
+
+    if pp_for_k(n) <= px:
+        out["sliding_window_s"] = duration
+        out["saturated"] = True
+    else:
+        lo, hi = 2, n
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if pp_for_k(mid) <= px:
+                lo = mid
+            else:
+                hi = mid
+        out["sliding_window_s"] = (lo - 1) * Ts
+
+    finite = [(k, v) for k, v in (
+        ("linear_s", out["linear_s"]),
+        ("instantaneous_s", out["instantaneous_s"]),
+        ("sliding_window_s", out["sliding_window_s"]),
+    ) if v is not None and math.isfinite(v)]
+    if finite:
+        out["binding"] = min(finite, key=lambda kv: kv[1])[0]
+    return out
+
+
 def _ssa_analysis(sequence_df, log):
     """SSA decomposition + FFT + reconstruction (ported from v0p2).
 
@@ -919,6 +1079,10 @@ def _ssa_analysis(sequence_df, log):
             "drift_slope_arcsec_per_min": drift_slope_arcsec_per_min,
             "components":                 components,
         },
+        "arrays": {
+            "time_axis":           t,
+            "reconstructed_ra":    signal_rebuilt,
+        },
     }
 
 
@@ -957,7 +1121,8 @@ def _fig_to_image_flowable(fig, max_width_pt, max_height_pt):
 
 def _build_pdf_report(out_path, *,
                       title, capture_metadata, solver, frame_range,
-                      drift_metrics, ssa_metrics, figures, log):
+                      drift_metrics, ssa_metrics, figures, log,
+                      max_exposure_metrics=None):
     """Build the multi-page PDF report and write it to `out_path`.
 
     `figures` is the merged dict from both analysis stages (string name
@@ -1140,6 +1305,92 @@ def _build_pdf_report(out_path, *,
             "Figure 2 — RA and DEC error in arcseconds with the fitted "
             "linear drift overlaid.", h_caption))
 
+    # ---- Maximum unguided exposure time ----------------------------------
+    if max_exposure_metrics is not None:
+        story.append(PageBreak())
+        story.append(Paragraph("Maximum unguided exposure time", h_section))
+        story.append(Paragraph(
+            "The combined drift and periodic error sets a practical upper "
+            "bound on how long a single sub-exposure can be before stars "
+            "smear across more than one pixel. Three complementary estimates "
+            "are reported below.", h_body))
+        story.append(Paragraph(
+            "<b>Linear drift only</b> assumes a constant drift rate over the "
+            "exposure: <i>T = pixel / |slope|</i>. This is the long-capture "
+            "limit, useful when the periodic error is small relative to the "
+            "linear trend. <b>Instantaneous worst case</b> uses the steepest "
+            "slope of the signal (drift plus the SSA-reconstructed periodic "
+            "components for RA): <i>T = pixel / max|dθ/dt|</i>. It is the "
+            "most conservative figure — valid at the worst phase of the PE "
+            "cycle. <b>Sliding window</b> is the physically correct answer: "
+            "the largest exposure length T such that, starting at any point "
+            "in the capture, the star's total excursion within T stays under "
+            "one pixel.", h_body))
+
+        px = max_exposure_metrics["pixel_scale"]
+        src_human = {
+            "override":  "user override",
+            "CD":        "CD matrix",
+            "CDELT":     "CDELT keywords",
+            "FOCALLEN":  "FOCALLEN + XPIXSZ",
+        }.get(px["source"], px["source"])
+        if abs(px["ra_arcsec_per_pixel"] - px["dec_arcsec_per_pixel"]) > 1e-3:
+            scale_text = (f"{px['ra_arcsec_per_pixel']:.3f} arcsec/pixel (RA), "
+                          f"{px['dec_arcsec_per_pixel']:.3f} arcsec/pixel (DEC)")
+        else:
+            scale_text = f"{px['ra_arcsec_per_pixel']:.3f} arcsec/pixel"
+        story.append(Paragraph(
+            f"Pixel scale used: <b>{scale_text}</b> (source: {src_human}).",
+            h_body))
+
+        binding_human = {
+            "linear_s":         "linear drift",
+            "instantaneous_s":  "instantaneous",
+            "sliding_window_s": "sliding window",
+        }
+        exp_rows = [["Axis", "Linear drift", "Instantaneous",
+                     "Sliding window", "Binding limit"]]
+        for axis_label, axis_key in (("RA", "ra"), ("DEC", "dec")):
+            m = max_exposure_metrics[axis_key]
+            binding = (binding_human.get(m.get("binding"), "—")
+                       if m.get("binding") else "—")
+            exp_rows.append([
+                axis_label,
+                _format_seconds(m["linear_s"]),
+                _format_seconds(m["instantaneous_s"]),
+                _format_seconds(m["sliding_window_s"]),
+                binding,
+            ])
+        exp_table = Table(exp_rows, hAlign="LEFT",
+                          colWidths=[2 * cm, 3.5 * cm, 3.5 * cm,
+                                     3.5 * cm, 3 * cm])
+        exp_table.setStyle(TableStyle([
+            ("BACKGROUND",  (0, 0), (-1, 0), colors.HexColor("#2e2e2e")),
+            ("TEXTCOLOR",   (0, 0), (-1, 0), colors.white),
+            ("FONTNAME",    (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("ALIGN",       (1, 1), (-1, -1), "RIGHT"),
+            ("GRID",        (0, 0), (-1, -1), 0.4, colors.HexColor("#ccc")),
+            ("FONTSIZE",    (0, 0), (-1, -1), 10),
+        ]))
+        story.append(exp_table)
+        story.append(Spacer(0, 0.4 * cm))
+
+        ra_m = max_exposure_metrics["ra"]
+        if ra_m.get("sliding_window_s") is not None:
+            if ra_m.get("saturated"):
+                story.append(Paragraph(
+                    "Over the analysed window, the cumulative RA motion never "
+                    "exceeded one pixel — exposure length on this capture is "
+                    "not bounded by tracking error.", h_body))
+            else:
+                story.append(Paragraph(
+                    f"On the RA axis, single sub-exposures up to "
+                    f"<b>{_format_seconds(ra_m['sliding_window_s'])}</b> "
+                    "should keep stars within one pixel of motion (sliding-"
+                    "window criterion). Beyond that length, the drift+PE "
+                    "envelope inside one exposure exceeds the pixel scale.",
+                    h_body))
+
     story.append(PageBreak())
     story.append(Paragraph("Results — Singular Spectrum Analysis", h_section))
     story.append(Paragraph(
@@ -1261,6 +1512,23 @@ def _build_pdf_report(out_path, *,
         "the periodic part; reducing the residual requires improvements to "
         "the optical train rigidity, autoguiding, or the observing site.",
         h_body))
+    if max_exposure_metrics is not None and fund_comp \
+            and fund_comp.get("period_s") and fund_pp > 0:
+        amp = fund_pp / 2.0
+        peak_slew = 2 * math.pi * amp / float(fund_comp["period_s"])
+        ra_m = max_exposure_metrics["ra"]
+        binding_human = {"linear_s":         "linear drift",
+                         "instantaneous_s":  "instantaneous slew",
+                         "sliding_window_s": "sliding window"}
+        binding_label = binding_human.get(ra_m.get("binding"), "the table above")
+        story.append(Paragraph(
+            f"The fundamental component (amplitude {amp:.1f}″ over a "
+            f"{fund_comp['period_s']:.0f}-second worm period) implies a peak "
+            f"slew rate of <b>{peak_slew:.2f} arcsec/s</b> at the worst phase. "
+            f"At the pixel scale used here this is the dominant constraint on "
+            f"unguided exposure length whenever the linear drift is small. "
+            f"The {binding_label} estimate is the binding limit on the RA "
+            "axis for this capture.", h_body))
     story.append(Paragraph(
         "<b>Caveats.</b> The analysis is sensitive to the chosen frame "
         "window. Windows shorter than two worm cycles may misidentify the "
@@ -1278,7 +1546,8 @@ def _build_pdf_report(out_path, *,
 def compute_periodic_error(fits_files, first_idx, last_idx,
                            use_astap, astap_cli, siril,
                            do_plate_solve, log,
-                           save_pdf=False, report_title=None):
+                           save_pdf=False, report_title=None,
+                           pixel_scale_override=None):
     """Run the full PE pipeline on the selected FITS window.
 
     The work is synchronous (the GUI freezes during plate-solving on large
@@ -1318,6 +1587,35 @@ def compute_periodic_error(fits_files, first_idx, last_idx,
 
     drift_result = _plot_plate_solve_data(sequence_df, log)
     ssa_result = _ssa_analysis(sequence_df, log)
+
+    # Maximum unguided exposure time (drift + PE under one pixel).
+    # Uses the SSA-reconstructed RA signal (smoother, free of fit noise) and
+    # the raw DEC drift from _plot_plate_solve_data.
+    max_exposure_metrics = None
+    pixel_scale = _compute_pixel_scale(sequence_df, pixel_scale_override, log)
+    if pixel_scale is not None:
+        t_ra = ssa_result["arrays"]["time_axis"]
+        ra_signal = ssa_result["arrays"]["reconstructed_ra"]
+        t_dec = _time_axis(sequence_df)
+        dec_signal = sequence_df["Delta_CRVAL2"].to_numpy(dtype=float) * 3600.0
+        max_exposure_metrics = {
+            "pixel_scale": pixel_scale,
+            "ra":  _max_exposure_time(t_ra, ra_signal,
+                                      pixel_scale["ra_arcsec_per_pixel"]),
+            "dec": _max_exposure_time(t_dec, dec_signal,
+                                      pixel_scale["dec_arcsec_per_pixel"]),
+        }
+        for axis_label, axis_key in (("RA", "ra"), ("DEC", "dec")):
+            m = max_exposure_metrics[axis_key]
+            if m.get("binding") is None:
+                continue
+            log(f"[PE] Max exposure ({axis_label}): "
+                f"linear {_format_seconds(m['linear_s'])}, "
+                f"instantaneous {_format_seconds(m['instantaneous_s'])}, "
+                f"sliding-window {_format_seconds(m['sliding_window_s'])} "
+                f"(binding: {m['binding']})",
+                color=LogColor.GREEN)
+
     log("[PE] Analysis complete.", color=LogColor.GREEN)
 
     if save_pdf:
@@ -1342,6 +1640,7 @@ def compute_periodic_error(fits_files, first_idx, last_idx,
             frame_range=(first_idx, last_idx),
             drift_metrics=drift_result["metrics"],
             ssa_metrics=ssa_result["metrics"],
+            max_exposure_metrics=max_exposure_metrics,
             figures=merged_figures,
             log=log,
         )
@@ -1423,6 +1722,8 @@ class PEAnalysisInterface:
         self.end_index_var       = tk.IntVar(self.root,    value=self.nb_fits)
         self.do_plate_solve_var  = tk.BooleanVar(self.root, value=True)
         self.save_pdf_var        = tk.BooleanVar(self.root, value=False)
+        # String (not Double) so empty = auto-detect from headers.
+        self.pixel_scale_var     = tk.StringVar(self.root, value="")
 
         # Auto-populate the report title from the first FITS file's OBJECT
         # keyword, falling back to the working-directory name. The user can
@@ -1520,6 +1821,25 @@ class PEAnalysisInterface:
             foreground="gray",
         ).grid(row=5, column=0, columnspan=2, sticky="w",
                padx=(28, 5), pady=(0, 4))
+
+        ttk.Label(proc_frame, text="Pixel scale (arcsec/pixel):").grid(
+            row=6, column=0, sticky="e", padx=5, pady=(8, 2))
+        pixel_scale_entry = ttk.Entry(
+            proc_frame, textvariable=self.pixel_scale_var, width=10,
+        )
+        pixel_scale_entry.grid(row=6, column=1, sticky="w", padx=5, pady=(8, 2))
+        tksiril.create_tooltip(
+            pixel_scale_entry,
+            "Leave empty to auto-detect from the plate solve "
+            "(CD matrix / CDELT / FOCALLEN+XPIXSZ). Override only if the "
+            "FITS headers are wrong. Used by the 'Maximum unguided exposure "
+            "time' section of the PDF report.",
+        )
+        ttk.Label(
+            proc_frame,
+            text="(leave empty to auto-detect from the plate solve)",
+            foreground="gray",
+        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 4))
 
         # Report frame (title + save PDF checkbox)
         report_frame = ttk.LabelFrame(main_frame, text="Report", padding=10)
@@ -1642,6 +1962,21 @@ class PEAnalysisInterface:
             self.siril.log(f"[PE] {err}", color=LogColor.RED)
             return
 
+        pixel_scale_text = self.pixel_scale_var.get().strip()
+        pixel_scale_override = None
+        if pixel_scale_text:
+            try:
+                pixel_scale_override = float(pixel_scale_text.replace(",", "."))
+                if pixel_scale_override <= 0:
+                    raise ValueError("must be > 0")
+            except ValueError:
+                msg = (f"Pixel scale must be a positive number "
+                       f"(got '{pixel_scale_text}'). Leave empty to "
+                       "auto-detect from the plate solve.")
+                messagebox.showwarning("Invalid pixel scale", msg)
+                self.siril.log(f"[PE] {msg}", color=LogColor.RED)
+                return
+
         use_astap = self.solver_var.get() == self.PLATE_SOLVER_ASTAP
         self.siril.log(
             f"[PE] Processing frames {t0}..{t_end} with "
@@ -1658,6 +1993,7 @@ class PEAnalysisInterface:
                 self._log,
                 save_pdf=self.save_pdf_var.get(),
                 report_title=self.report_title_var.get(),
+                pixel_scale_override=pixel_scale_override,
             )
         except FileNotFoundError as exc:
             self.siril.log(f"[PE] {exc}", color=LogColor.RED)
