@@ -66,7 +66,7 @@ from unidecode import unidecode       # noqa: E402
 # =============================================================================
 APP_NAME       = "Automatic Periodic Error Computation"
 AUTHORS        = "Mickaël HILAIRET and Gilles MORAIN"
-VERSION        = "0.6.0"
+VERSION        = "0.6.1"
 REQUIRED_SIRIL = "1.3.6"
 
 # Platform-specific default paths to the ASTAP and Siril CLI executables.
@@ -800,19 +800,25 @@ def _my_fft(t, signal, Ts, plot, mark_all_components, tab_info, log):
     return amp_fond, phase_fond, freq_fond, t_fond, fig
 
 
-def _max_exposure_time(t, signal_arcsec, pixel_scale_arcsec):
+def _max_exposure_time(t, signal_arcsec, pixel_scale_arcsec,
+                       fundamental_period_s):
     """Estimate the longest exposure window keeping drift+PE under one pixel.
 
     Returns a dict with three complementary estimates (all in seconds):
 
     - ``linear_s``         pixel / |least-squares slope| (long-term drift only)
-    - ``instantaneous_s``  pixel / max |dsignal/dt|     (worst-case slew rate)
+    - ``instantaneous_s``  pixel / (|slope| + 2π·rms_detrended / period)
+                           — closed-form envelope of drift plus the
+                           dominant periodic component, robust to
+                           per-sample plate-solver scatter
     - ``sliding_window_s`` largest window whose peak-to-peak ≤ one pixel
 
     Plus ``binding`` (the name of the smallest finite estimate),
-    ``duration_s`` (observation window), and ``saturated`` (True if the
+    ``duration_s`` (observation window), ``saturated`` (True if the
     whole capture never exceeds one pixel, so ``sliding_window_s`` is
-    pinned at the duration). Pure function — no logging.
+    pinned at the duration), and ``peak_slew_arcsec_per_s`` (the slew
+    rate used in ``instantaneous_s``, exposed for diagnostics).
+    Pure function — no logging.
     """
     t = np.asarray(t, dtype=float)
     s = np.asarray(signal_arcsec, dtype=float)
@@ -820,18 +826,32 @@ def _max_exposure_time(t, signal_arcsec, pixel_scale_arcsec):
     duration = float(t[-1] - t[0]) if n > 1 else 0.0
     out = {"linear_s": None, "instantaneous_s": None,
            "sliding_window_s": None, "binding": None,
-           "duration_s": duration, "saturated": False}
+           "duration_s": duration, "saturated": False,
+           "peak_slew_arcsec_per_s": None}
     if n < 2 or duration <= 0 or pixel_scale_arcsec is None \
             or pixel_scale_arcsec <= 0:
         return out
     px = float(pixel_scale_arcsec)
     Ts = duration / (n - 1)
 
-    slope = float(np.polyfit(t, s, 1)[0])
+    poly = np.polyfit(t, s, 1)
+    slope = float(poly[0])
     out["linear_s"] = px / abs(slope) if abs(slope) > 1e-12 else float("inf")
 
-    max_slope = float(np.max(np.abs(np.gradient(s, t))))
-    out["instantaneous_s"] = (px / max_slope if max_slope > 1e-12
+    # Instantaneous envelope: drift slope + 2π · rms(detrended) / period.
+    # For a pure sinusoid this slightly under-estimates the true peak slew
+    # (rms = amplitude/√2 ≈ 0.71 × amplitude), but unlike np.gradient it
+    # is immune to the per-sample plate-solver scatter that would
+    # otherwise dominate the metric on the noisier Dec axis.
+    residual = s - np.poly1d(poly)(t)
+    rms_residual = float(math.sqrt(np.mean(residual * residual)))
+    if fundamental_period_s and fundamental_period_s > 0:
+        peak_slew = abs(slope) + (2.0 * math.pi * rms_residual
+                                  / float(fundamental_period_s))
+    else:
+        peak_slew = abs(slope)
+    out["peak_slew_arcsec_per_s"] = peak_slew
+    out["instantaneous_s"] = (px / peak_slew if peak_slew > 1e-12
                               else float("inf"))
 
     def pp_for_k(k):
@@ -1318,14 +1338,17 @@ def _build_pdf_report(out_path, *,
             "<b>Linear drift only</b> assumes a constant drift rate over the "
             "exposure: <i>T = pixel / |slope|</i>. This is the long-capture "
             "limit, useful when the periodic error is small relative to the "
-            "linear trend. <b>Instantaneous worst case</b> uses the steepest "
-            "slope of the signal (drift plus the SSA-reconstructed periodic "
-            "components for RA): <i>T = pixel / max|dθ/dt|</i>. It is the "
-            "most conservative figure — valid at the worst phase of the PE "
-            "cycle. <b>Sliding window</b> is the physically correct answer: "
-            "the largest exposure length T such that, starting at any point "
-            "in the capture, the star's total excursion within T stays under "
-            "one pixel.", h_body))
+            "linear trend. <b>Instantaneous</b> uses a closed-form envelope "
+            "of the drift plus the dominant periodic component: "
+            "<i>T = pixel / (|slope| + 2π·σ / P)</i>, where σ is the RMS of "
+            "the detrended signal and P is the worm-period fundamental "
+            "from the SSA decomposition. Using σ rather than the numerical "
+            "derivative filters out per-frame plate-solver scatter (a few "
+            "tenths of an arcsec) that would otherwise dominate the metric, "
+            "especially on the noisier DEC axis. <b>Sliding window</b> is "
+            "the physically correct answer: the largest exposure length T "
+            "such that, starting at any point in the capture, the star's "
+            "total excursion within T stays under one pixel.", h_body))
 
         px = max_exposure_metrics["pixel_scale"]
         src_human = {
@@ -1515,20 +1538,20 @@ def _build_pdf_report(out_path, *,
     if max_exposure_metrics is not None and fund_comp \
             and fund_comp.get("period_s") and fund_pp > 0:
         amp = fund_pp / 2.0
-        peak_slew = 2 * math.pi * amp / float(fund_comp["period_s"])
         ra_m = max_exposure_metrics["ra"]
+        peak_slew = ra_m.get("peak_slew_arcsec_per_s") or 0.0
         binding_human = {"linear_s":         "linear drift",
-                         "instantaneous_s":  "instantaneous slew",
+                         "instantaneous_s":  "instantaneous envelope",
                          "sliding_window_s": "sliding window"}
         binding_label = binding_human.get(ra_m.get("binding"), "the table above")
         story.append(Paragraph(
             f"The fundamental component (amplitude {amp:.1f}″ over a "
-            f"{fund_comp['period_s']:.0f}-second worm period) implies a peak "
-            f"slew rate of <b>{peak_slew:.2f} arcsec/s</b> at the worst phase. "
-            f"At the pixel scale used here this is the dominant constraint on "
-            f"unguided exposure length whenever the linear drift is small. "
-            f"The {binding_label} estimate is the binding limit on the RA "
-            "axis for this capture.", h_body))
+            f"{fund_comp['period_s']:.0f}-second worm period) drives an RA "
+            f"slew envelope of <b>{peak_slew:.2f} arcsec/s</b> "
+            f"(|drift| + 2π·σ/P, with σ the RMS of the detrended signal). "
+            f"At the pixel scale used here this dominates whenever the "
+            f"linear drift is small. The {binding_label} estimate is the "
+            "binding limit on the RA axis for this capture.", h_body))
     story.append(Paragraph(
         "<b>Caveats.</b> The analysis is sensitive to the chosen frame "
         "window. Windows shorter than two worm cycles may misidentify the "
@@ -1590,7 +1613,9 @@ def compute_periodic_error(fits_files, first_idx, last_idx,
 
     # Maximum unguided exposure time (drift + PE under one pixel).
     # Uses the SSA-reconstructed RA signal (smoother, free of fit noise) and
-    # the raw DEC drift from _plot_plate_solve_data.
+    # the raw DEC drift from _plot_plate_solve_data. The mount's worm
+    # period (from the RA SSA fundamental) is shared with the DEC axis
+    # so the instantaneous estimate uses a consistent periodic envelope.
     max_exposure_metrics = None
     pixel_scale = _compute_pixel_scale(sequence_df, pixel_scale_override, log)
     if pixel_scale is not None:
@@ -1598,12 +1623,15 @@ def compute_periodic_error(fits_files, first_idx, last_idx,
         ra_signal = ssa_result["arrays"]["reconstructed_ra"]
         t_dec = _time_axis(sequence_df)
         dec_signal = sequence_df["Delta_CRVAL2"].to_numpy(dtype=float) * 3600.0
+        period_s = ssa_result["metrics"].get("fundamental_period_s")
         max_exposure_metrics = {
             "pixel_scale": pixel_scale,
             "ra":  _max_exposure_time(t_ra, ra_signal,
-                                      pixel_scale["ra_arcsec_per_pixel"]),
+                                      pixel_scale["ra_arcsec_per_pixel"],
+                                      period_s),
             "dec": _max_exposure_time(t_dec, dec_signal,
-                                      pixel_scale["dec_arcsec_per_pixel"]),
+                                      pixel_scale["dec_arcsec_per_pixel"],
+                                      period_s),
         }
         for axis_label, axis_key in (("RA", "ra"), ("DEC", "dec")):
             m = max_exposure_metrics[axis_key]
