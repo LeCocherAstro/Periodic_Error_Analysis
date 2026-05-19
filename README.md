@@ -17,7 +17,7 @@ flowchart LR
     H --> I[Matplotlib figures<br/>+ stats in Siril log]
 ```
 
-The Singular Spectrum Analysis (SSA) function is based on Matlab code from Francisco Javier Alonso Sanchez, Departament of Electronics and Electromecanical Engineering Industrial Engineering School, University of Extremadura, Badajoz, Spain and improved by François Auger, Nantes University, France, *"The Sliding Singular Spectrum Analysis: A Data-Driven Nonstationary Signal Decomposition Tool"*, IEEE TRANSACTIONS ON SIGNAL PROCESSING vol. 66 no. 1, January 2018.
+The Singular Spectrum Analysis (SSA) function is based on Matlab code from Francisco Javier Alonso Sanchez, Department of Electronics and Electromecanical Engineering Industrial Engineering School, University of Extremadura, Badajoz, Spain and improved by François Auger, Nantes University, France, *"The Sliding Singular Spectrum Analysis: A Data-Driven Nonstationary Signal Decomposition Tool"*, IEEE TRANSACTIONS ON SIGNAL PROCESSING vol. 66 no. 1, January 2018.
 
 ## Example output
 
