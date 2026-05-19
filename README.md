@@ -43,16 +43,15 @@ Two of the synthesis figures the script produces (also embedded in the optional 
    - Pick a plate-solver: **ASTAP** (browse to the executable if the default path doesn't match) or **SIRIL (GAIA)** (no path needed — Siril's built-in solver runs in-process). The selected paths are persisted to `config_PE.txt` next to the script.
    - Set the **begin / end frame indices** to constrain the analysis window. The window must contain at least **58 frames** — the Singular Spectrum Analysis stage extracts 10 eigencomponents, which requires the trajectory-matrix dimension `L = n / 5.71` to be ≥ 10. Narrower windows are rejected with a clear error.
    - Toggle **Run plate solve** off to reuse the WCS results from a previous **ASTAP** run (cached in a `PlateSolveAstap/` subfolder of your FITS directory). The Siril/GAIA path does not cache — it always re-solves, so this toggle must stay enabled when SIRIL is selected.
-   - (Optional) In the **Report** section, edit the title (auto-populated from the FITS `OBJECT` keyword or the folder name) and tick **Save PDF report** to write a multi-page PDF with cover, methodology, results and discussion next to the FITS folder.
+   - (Optional) In the **Report** section, edit the title (auto-populated from the FITS `OBJECT` keyword or the folder name) and tick **Save PDF report** to write a multi-page PDF with cover, methodology and results next to the FITS folder.
    - Click **Process**.
 
-Progress and per-component statistics (RA / DEC drift, mean sampling period, eigencomponent grouping, fundamental period and amplitude, harmonics min/max/RMS, reconstruction RMSE) stream to Siril's log panel. Plots open in separate matplotlib windows. When the **Save PDF report** option is enabled, a self-contained `<folder>_PE_report_<timestamp>.pdf` is also written next to the FITS folder — useful for archiving a definitive result or sharing with collaborators.
+Progress and per-component statistics (RA / DEC drift, mean sampling period, eigencomponent grouping, fundamental period and amplitude, harmonics min/max/RMS, reconstruction RMSE) stream to Siril's log panel. Plots open in separate matplotlib windows. When the **Save PDF report** option is enabled, a self-contained `<folder>_PE_report_<timestamp>.pdf` is also written next to the FITS folder.
 
 ## Limitations
 
 - **Siril/GAIA path always re-solves** — cached reuse via the "Run plate solve" toggle is ASTAP-only for now (the Siril loop keeps WCS in memory and doesn't write sidecars). Focal-length and pixel-size hints (`FOCALLEN`, `XPIXSZ × XBINNING`) are passed to Siril's solver from the first frame's FITS header so the per-frame solve doesn't waste time on blind scale search.
 - **Long captures freeze the GUI** during plate-solving (processing is synchronous, on the Tk main thread). Log messages still flow.
-- **macOS AppleDouble files** (`._*.fits`) are filtered out automatically.
 
 ## License
 
