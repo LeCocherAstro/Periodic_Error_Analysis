@@ -287,10 +287,14 @@ def _plate_solve_siril(fits_paths, siril, log):
     # so cmd("load", abs_path) breaks on paths with spaces or many dots.
     # Fall back to bare filenames — Siril's working directory is already the
     # FITS folder (the script discovered the .fits files there at startup).
+    # Filenames can still embed spaces (e.g. 'Optolong L-Pro'); sirilpy's
+    # cmd() just joins args with " " before shipping to Siril, so we
+    # double-quote the filename to keep it as a single token in Siril's
+    # command parser.
     for i, fits_path in enumerate(fits_paths, 1):
         log(f"[PE]   [{i}/{n}] Solving {fits_path.name}")
         try:
-            siril.cmd("load", fits_path.name)
+            siril.cmd("load", f'"{fits_path.name}"')
             siril.cmd("platesolve", *hints)
             header = siril.get_image_fits_header(return_as="dict")
             records.append(header)
