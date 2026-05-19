@@ -66,7 +66,7 @@ from unidecode import unidecode       # noqa: E402
 # =============================================================================
 APP_NAME       = "Automatic Periodic Error Computation"
 AUTHORS        = "Mickaël HILAIRET and Gilles MORAIN"
-VERSION        = "0.6.1"
+VERSION        = "0.6.2"
 REQUIRED_SIRIL = "1.3.6"
 
 # Platform-specific default paths to the ASTAP and Siril CLI executables.
@@ -1363,8 +1363,13 @@ def _build_pdf_report(out_path, *,
         else:
             scale_text = f"{px['ra_arcsec_per_pixel']:.3f} arcsec/pixel"
         story.append(Paragraph(
-            f"Pixel scale used: <b>{scale_text}</b> (source: {src_human}).",
-            h_body))
+            f"Pixel scale used: <b>{scale_text}</b> (source: {src_human}). "
+            "Because drift and periodic error are mount properties measured "
+            "in arcseconds, the pixel-scale override field can also be used "
+            "to simulate a different camera or binning factor: enter "
+            "<i>206.265 × pixel_µm / focal_length_mm</i>, multiplied by the "
+            "bin factor if applicable, to predict the tracking-limited "
+            "exposure on a hypothetical setup.", h_body))
 
         binding_human = {
             "linear_s":         "linear drift",
