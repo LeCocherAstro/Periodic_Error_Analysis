@@ -1456,6 +1456,8 @@ class PEAnalysisInterface:
             tooltip=("Plate-solve via the external ASTAP CLI. Writes .wcs "
                      "sidecars to PlateSolveAstap/ so 'Run plate solve' "
                      "can be unticked on subsequent runs to skip ASTAP."),
+            hint=("External ASTAP CLI — caches .wcs sidecars in "
+                  "PlateSolveAstap/ so re-runs can skip plate-solving."),
         )
         self._build_solver_row(
             tools_frame, "SIRIL (GAIA)", self.PLATE_SOLVER_SIRIL,
@@ -1463,6 +1465,8 @@ class PEAnalysisInterface:
             tooltip=("Plate-solve via Siril's built-in GAIA solver. "
                      "Works without ASTAP installed, but re-solves every "
                      "run — 'Run plate solve' must stay enabled."),
+            hint=("Siril's built-in GAIA solver — no ASTAP needed, but "
+                  "re-solves every run."),
         )
 
         # Processing parameters frame
@@ -1496,18 +1500,26 @@ class PEAnalysisInterface:
 
         ttk.Label(
             proc_frame,
-            text=f"(SSA requires at least {SSA_MIN_FRAMES} frames in the window)",
+            text=(f"(valid range 1..{self.nb_fits}; "
+                  f"window must contain ≥ {SSA_MIN_FRAMES} frames for SSA)"),
             foreground="gray",
         ).grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 4))
 
         plate_solve_cb = ttk.Checkbutton(
             proc_frame, text="Run plate solve", variable=self.do_plate_solve_var,
         )
-        plate_solve_cb.grid(row=4, column=0, columnspan=2, sticky="w", padx=5, pady=(8, 0))
+        plate_solve_cb.grid(row=4, column=0, columnspan=2, sticky="w",
+                            padx=5, pady=(8, 0))
         tksiril.create_tooltip(
             plate_solve_cb,
             "Disable to reuse plate-solving results from a previous run.",
         )
+        ttk.Label(
+            proc_frame,
+            text="(disable to reuse cached results from a previous run)",
+            foreground="gray",
+        ).grid(row=5, column=0, columnspan=2, sticky="w",
+               padx=(28, 5), pady=(0, 4))
 
         # Report frame (title + save PDF checkbox)
         report_frame = ttk.LabelFrame(main_frame, text="Report", padding=10)
@@ -1525,12 +1537,17 @@ class PEAnalysisInterface:
             "Title for the PDF report's cover page. Auto-populated from the "
             "FITS OBJECT keyword (or the FITS folder name) — edit as needed.",
         )
+        ttk.Label(
+            report_frame,
+            text="(auto-filled from the FITS OBJECT keyword — edit as needed)",
+            foreground="gray",
+        ).grid(row=1, column=1, sticky="w", padx=5, pady=(0, 4))
 
         save_pdf_cb = ttk.Checkbutton(
             report_frame, text="Save PDF report",
             variable=self.save_pdf_var,
         )
-        save_pdf_cb.grid(row=1, column=0, columnspan=2, sticky="w",
+        save_pdf_cb.grid(row=2, column=0, columnspan=2, sticky="w",
                          padx=5, pady=(6, 0))
         tksiril.create_tooltip(
             save_pdf_cb,
@@ -1538,6 +1555,13 @@ class PEAnalysisInterface:
             "results with embedded figures, discussion) is written next to "
             "the FITS folder after analysis completes.",
         )
+        ttk.Label(
+            report_frame,
+            text="(writes a multi-page PDF next to the FITS folder "
+                 "after analysis)",
+            foreground="gray",
+        ).grid(row=3, column=0, columnspan=2, sticky="w",
+               padx=(28, 5), pady=(0, 4))
 
         # Buttons
         button_frame = ttk.Frame(main_frame)
@@ -1552,7 +1576,7 @@ class PEAnalysisInterface:
         tksiril.create_tooltip(close_btn, "Close the script (no changes to images).")
 
     def _build_solver_row(self, parent, label, value, path_var, browse_cmd,
-                          tooltip=None):
+                          tooltip=None, hint=None):
         row = ttk.Frame(parent)
         row.pack(fill=tk.X, pady=2)
         radio = ttk.Radiobutton(
@@ -1565,6 +1589,10 @@ class PEAnalysisInterface:
             side=tk.LEFT, padx=5, fill=tk.X, expand=True,
         )
         ttk.Button(row, text="Browse...", command=browse_cmd).pack(side=tk.LEFT)
+        if hint:
+            ttk.Label(parent, text=hint, foreground="gray").pack(
+                fill=tk.X, padx=(118, 5), pady=(0, 4),
+            )
 
     def _log(self, msg, color=LogColor.DEFAULT):
         """Adapter so module-level helpers can call self.siril.log()."""
