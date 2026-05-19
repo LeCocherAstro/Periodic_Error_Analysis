@@ -1094,7 +1094,7 @@ def _build_pdf_report(out_path, *,
         "(SSA), a model-free technique that builds a trajectory matrix from "
         "the signal, performs an SVD, and reconstructs the components from "
         "the leading eigentriples. Adjacent eigenpairs with similar "
-        "eigenvalues are merged as sinusoid pairs, identifying the secular "
+        "eigenvalues are merged as sinusoid pairs, identifying the linear "
         "drift, the worm-period fundamental, and the dominant harmonics. "
         "An FFT applied to each grouped sinusoid yields its precise period "
         "and amplitude.", h_body))
@@ -1140,7 +1140,7 @@ def _build_pdf_report(out_path, *,
         f"{ssa_metrics['n_frames']} samples (mean sampling period "
         f"{ssa_metrics['sampling_period_s']:.2f} s), extracting "
         f"{SSA_NB_EIGEN} eigencomponents grouped into "
-        f"{SSA_GROUP_ORDER + 1} dominant components (the secular drift "
+        f"{SSA_GROUP_ORDER + 1} dominant components (the linear drift "
         "plus the fundamental and four harmonics).", h_body))
     if "singular_spectrum" in figures:
         story.append(_fig_to_image_flowable(figures["singular_spectrum"],
@@ -1180,7 +1180,7 @@ def _build_pdf_report(out_path, *,
         story.append(_fig_to_image_flowable(figures["stacked_components"],
                                             content_width, 22 * cm))
         story.append(Paragraph(
-            "Figure 4 — Stacked SSA components: secular drift plus the "
+            "Figure 4 — Stacked SSA components: linear drift plus the "
             "fundamental and four harmonics, each annotated with its peak "
             "amplitude.", h_caption))
     if "fft_all_components" in figures:
@@ -1188,7 +1188,7 @@ def _build_pdf_report(out_path, *,
         story.append(_fig_to_image_flowable(figures["fft_all_components"],
                                             content_width, 22 * cm))
         story.append(Paragraph(
-            "Figure 5 — FFT of the detrended RA error with the SSA-"
+            "Figure 5 — FFT of the RA error (without the main drift) with the SSA-"
             "identified periods marked. Sharp peaks at the fundamental "
             "and integer fractions confirm the harmonic structure of the "
             "worm gear's error signature.", h_caption))
@@ -1200,7 +1200,7 @@ def _build_pdf_report(out_path, *,
         f"a reconstruction of the original RA error with a residual RMS of "
         f"<b>{ssa_metrics['rmse_arcsec']:.2f} arcsec</b>. A low RMSE "
         "indicates that the dominant tracking error is well-described by "
-        "the secular drift plus a handful of sinusoidal components — "
+        "the linear drift plus a handful of sinusoidal components — "
         "exactly the structure a PEC table can correct. A high RMSE points "
         "to non-periodic noise (seeing, wind, flexure) that PEC cannot "
         "address.", h_body))
@@ -1229,7 +1229,7 @@ def _build_pdf_report(out_path, *,
     ) if fund_comp else ""
     story.append(Paragraph(
         fund_text +
-        f"The RA secular drift over the capture averages "
+        f"The RA linear drift over the capture averages "
         f"{drift_rate:+.2f} arcsec/min; values within ±1 arcsec/min are "
         "typically consistent with a small polar-alignment residual, while "
         "larger drifts warrant a polar-alignment check before further mount "
