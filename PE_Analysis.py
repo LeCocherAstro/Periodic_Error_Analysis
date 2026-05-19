@@ -1288,13 +1288,14 @@ def _build_pdf_report(out_path, *,
         "An FFT applied to each grouped sinusoid yields its precise period "
         "and amplitude.", h_body))
     story.append(Paragraph(
-        "The SSA function is based on Matlab code from Francisco Javier "
-        "Alonso Sanchez, Department of Electronics and Electromecanical "
-        "Engineering, Industrial Engineering School, University of "
+        "The Singular Spectrum Analysis (SSA) function is based on "
+        "Matlab code from Francisco Javier Alonso Sanchez, "
+        "Department of Electronics and Electromecanical Engineering, "
+        "Industrial Engineering School, University of "
         "Extremadura, Badajoz, Spain, and improved by François Auger, "
         "Nantes University, France: <i>The Sliding Singular Spectrum "
         "Analysis: A Data-Driven Nonstationary Signal Decomposition Tool</i>, "
-        "IEEE Transactions on Signal Processing, vol. 66 no. 1, "
+        "IEEE TRANSACTIONS ON SIGNAL PROCESSING, vol. 66 no. 1, "
         "January 2018.", h_body))
 
     # ---- Results ----------------------------------------------------------
@@ -1485,11 +1486,11 @@ def _build_pdf_report(out_path, *,
         f"Summing the {SSA_GROUP_ORDER + 1} grouped SSA components yields "
         f"a reconstruction of the original RA error with a residual RMS of "
         f"<b>{ssa_metrics['rmse_arcsec']:.2f} arcsec</b>. A low RMSE "
-        "indicates that the dominant tracking error is well-described by "
-        "the linear drift plus a handful of sinusoidal components — "
-        "exactly the structure a PEC table can correct. A high RMSE points "
-        "to non-periodic noise (seeing, wind, flexure) that PEC cannot "
-        "address.", h_body))
+        "indicates that the SSA retrieves the dominant sinusoidale components "
+        "and drift. This reconstructed signal can be used for a "
+        "Periodic Error Correction (PEC). What's left after periodic components "
+        "have been removed is the unmodeled components, noise and error due "
+        "to the SSA algorithm.", h_body))
     if "reconstruction" in figures:
         story.append(_fig_to_image_flowable(figures["reconstruction"],
                                             content_width, 14 * cm))
@@ -1536,8 +1537,9 @@ def _build_pdf_report(out_path, *,
         f"With a reconstruction RMSE of {ssa_metrics['rmse_arcsec']:.2f} "
         "arcsec, the residual error after removing drift and the modelled "
         f"{SSA_GROUP_ORDER + 1}-component periodic structure represents the "
-        "stochastic floor (seeing, wind buffeting, flexure). PEC can address "
-        "the periodic part; reducing the residual requires improvements to "
+        "unmodeled components, noise and error due to the SSA algorithm."
+        "PEC can address the periodic part; "
+        "reducing the residual requires improvements to "
         "the optical train rigidity, autoguiding, or the observing site.",
         h_body))
     if max_exposure_metrics is not None and fund_comp \
@@ -1559,10 +1561,15 @@ def _build_pdf_report(out_path, *,
             "binding limit on the RA axis for this capture.", h_body))
     story.append(Paragraph(
         "<b>Caveats.</b> The analysis is sensitive to the chosen frame "
-        "window. Windows shorter than two worm cycles may misidentify the "
+        "window and sampling time of the image capture. "
+        "Windows shorter than two worm cycles may misidentify the "
         "fundamental period. Plate-solver scatter (typically a few tenths "
         "of an arcsecond per frame) sets a noise floor on the residual "
-        "RMSE that no amount of mount improvement can lower.", h_body))
+        "RMSE that no amount of mount improvement can lower."
+        "In order to largely comply with the Shannon criterion "
+        "and to represent a sinusoid by at least 20 to 40 captures, "
+        "use low sampling time value such as 1 or 2s in order to capture "
+        "the main harmonics of the RA error.", h_body))
 
     doc.build(story)
     log(f"[PE] PDF report saved to {out_path}", color=LogColor.GREEN)
