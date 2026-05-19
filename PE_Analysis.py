@@ -1,23 +1,23 @@
 """
 Automatic Periodic Error Computation - Siril Python script.
 
+Authors:
+Mickaël HILAIRET, LS2N/Ecole Centrale de Nantes, France
+and Gilles MORAIN, France
+
+Distributed under a Creative Commons Attribution ǀ 4.0
+International licence CC BY-NC-SA 4.0
+
 GUI-based Siril script that computes the periodic error of an equatorial
 mount from a time-series of FITS frames. The script collects FITS files
 from Siril's working directory, lets the user pick the plate-solving
 engine (ASTAP or Siril/GAIA) and the frame index range, then runs the
 analysis.
 
-The PE algorithm is the same one prototyped in PEC_Analysis_v0p2.py:
-  1. plate-solve each frame with ASTAP (CLI)
-  2. parse the resulting .wcs files into a DataFrame indexed by DATE-OBS
-  3. plot RA / DEC drift vs time and a linear drift fit
-  4. decompose the RA error signal with Singular Spectrum Analysis (SSA),
-     group eigencomponents into fundamental + harmonics, and characterise
-     each via FFT (amplitude, frequency, period)
-  5. reconstruct the signal, plot the components and the reconstruction RMSE
+See https://github.com/LeCocherAstro/Periodic_Error_Analysis for more information.
 
 Follows the official Siril Python scripting template:
-https://siril.readthedocs.io/en/stable/scripts/python_gui_template
+https://siril.readthedocs.io/en/stable/scripts/python_gui_template.html
 """
 
 # Core module imports
@@ -66,7 +66,7 @@ from unidecode import unidecode       # noqa: E402
 # =============================================================================
 APP_NAME       = "Automatic Periodic Error Computation"
 AUTHORS        = "Mickaël HILAIRET and Gilles MORAIN"
-VERSION        = "0.5.0"
+VERSION        = "0.5.1"
 REQUIRED_SIRIL = "1.3.6"
 
 # Platform-specific default paths to the ASTAP and Siril CLI executables.
@@ -872,10 +872,10 @@ def _ssa_analysis(sequence_df, log):
 
         if k == 1:
             name = "Fond"
-            title = f"Max value of Fond = {max_v:.2f} arcsec"
+            title = f"Max/Min values of Fond = {max_v:.2f} and {min_v:.2f} arcsec"
         else:
             name = f"H{k - 1}"
-            title = f"Max value of H{k - 1} = {max_v:.2f} arcsec"
+            title = f"Max/Min values of H{k - 1} = {max_v:.2f} and {min_v:.2f} arcsec"
         log(f"[PE] Max value of {name} = {max_v:.2f} arcsec")
         log(f"[PE] Min value of {name} = {min_v:.2f} arcsec")
         log(f"[PE] RMS value of {name} = {rms_v:.2f} arcsec")
