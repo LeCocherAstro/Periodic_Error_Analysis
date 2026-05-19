@@ -1099,10 +1099,13 @@ def _build_pdf_report(out_path, *,
         "An FFT applied to each grouped sinusoid yields its precise period "
         "and amplitude.", h_body))
     story.append(Paragraph(
-        "The implementation follows F.J. Alonso-Sanchez (Univ. of "
-        "Extremadura) and F. Auger (Nantes Univ.), <i>The Sliding Singular "
-        "Spectrum Analysis: A Data-Driven Nonstationary Signal Decomposition "
-        "Tool</i>, IEEE Transactions on Signal Processing, vol. 66 no. 1, "
+        "The SSA function is based on Matlab code from Francisco Javier "
+        "Alonso Sanchez, Department of Electronics and Electromecanical "
+        "Engineering, Industrial Engineering School, University of "
+        "Extremadura, Badajoz, Spain, and improved by François Auger, "
+        "Nantes University, France: <i>The Sliding Singular Spectrum "
+        "Analysis: A Data-Driven Nonstationary Signal Decomposition Tool</i>, "
+        "IEEE Transactions on Signal Processing, vol. 66 no. 1, "
         "January 2018.", h_body))
 
     # ---- Results ----------------------------------------------------------
