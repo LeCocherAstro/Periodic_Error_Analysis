@@ -53,6 +53,7 @@ Progress and per-component statistics (RA / DEC drift, mean sampling period of t
 
 - **Siril/GAIA path always re-solves** — cached reuse via the "Run plate solve" toggle is ASTAP-only for now (the Siril loop keeps WCS in memory and doesn't write sidecars). Focal-length and pixel-size hints (`FOCALLEN`, `XPIXSZ × XBINNING`) are passed to Siril's solver from the first frame's FITS header so the per-frame solve doesn't waste time on blind scale search.
 - **Long captures freeze the GUI** during plate-solving (processing is synchronous, on the Tk main thread). Log messages still flow.
+- As a reminder, to accurately assess the periodic error, you should take short exposures so that you have 20 to 40 exposures within the period of the highest-frequency harmonic you wish to capture, with at least two or three complete periods of the fundamental (worm gear), typically around 8 minutes, and without guiding.
 
 ## License
 
